@@ -37,6 +37,7 @@
 #include "version.h"
 #include "volumes.h"
 #include "utils.h"
+#include "commands.h"
 
 static char path_name[4096];
 static int get_snaps = 0;
@@ -101,9 +102,6 @@ int next_leaf(struct btrfs_root *root, struct btrfs_path *path)
 				return 1;
 			continue;
 		}
-
-		if (next)
-			free_extent_buffer(next);
 
 		if (path->reada)
 			reada_for_search(root, path, level, slot, 0);
@@ -173,7 +171,7 @@ static int copy_one_inline(int fd, struct btrfs_path *path, u64 pos)
 
 	done = pwrite(fd, outbuf, ram_size, pos);
 	free(outbuf);
-	if (done < len) {
+	if (done < ram_size) {
 		fprintf(stderr, "Short compressed inline write, wanted %d, "
 			"did %zd: %d\n", ram_size, done, errno);
 		return -1;
@@ -228,7 +226,7 @@ static int copy_one_extent(struct btrfs_root *root, int fd,
 again:
 	length = size_left;
 	ret = btrfs_map_block(&root->fs_info->mapping_tree, READ,
-			      bytenr, &length, &multi, 0);
+			      bytenr, &length, &multi, 0, NULL);
 	if (ret) {
 		free(inbuf);
 		free(outbuf);
@@ -624,6 +622,7 @@ static int search_dir(struct btrfs_root *root, struct btrfs_key *key,
 						PTR_ERR(search_root));
 					if (ignore_errors)
 						goto next;
+					btrfs_free_path(path);
 					return PTR_ERR(search_root);
 				}
 
@@ -675,12 +674,6 @@ next:
 	return 0;
 }
 
-static void usage()
-{
-	fprintf(stderr, "Usage: restore [-svio] [-t disk offset] <device> "
-		"<directory>\n");
-}
-
 static struct btrfs_root *open_fs(const char *dev, u64 root_location, int super_mirror)
 {
 	struct btrfs_root *root;
@@ -713,7 +706,7 @@ static int find_first_dir(struct btrfs_root *root, u64 *objectid)
 	path = btrfs_alloc_path();
 	if (!path) {
 		fprintf(stderr, "Ran out of memory\n");
-		goto out;
+		return ret;
 	}
 
 	ret = btrfs_search_slot(NULL, root, &key, path, 0, 0);
@@ -758,7 +751,26 @@ out:
 	return ret;
 }
 
-int main(int argc, char **argv)
+const char * const cmd_restore_usage[] = {
+	"btrfs restore [options] <device>",
+	"Try to restore files from a damaged filesystem (unmounted)",
+	"",
+	"-s              get snapshots",
+	"-v              verbose",
+	"-i              ignore errors",
+	"-o              overwrite",
+	"-t              tree location",
+	"-f <offset>     filesystem location",
+	"-u <block>      super mirror",
+	"-d              find dir",
+	"-r <num>        root objectid",
+	"-c              ignore case in regular expression",
+	"-m <regexp>     regular expression to match",
+	"-l              list roots",
+	NULL
+};
+
+int cmd_restore(int argc, char **argv)
 {
 	struct btrfs_root *root;
 	struct btrfs_key key;
@@ -815,15 +827,12 @@ int main(int argc, char **argv)
 				find_dir = 1;
 				break;
 			default:
-				usage();
-				exit(1);
+				usage(cmd_restore_usage);
 		}
 	}
 
-	if (optind + 1 >= argc) {
-		usage();
-		exit(1);
-	}
+	if (optind + 1 >= argc)
+		usage(cmd_restore_usage);
 
 	if ((ret = check_mounted(argv[optind])) < 0) {
 		fprintf(stderr, "Could not check mount status: %s\n",
@@ -831,7 +840,7 @@ int main(int argc, char **argv)
 		return ret;
 	} else if (ret) {
 		fprintf(stderr, "%s is currently mounted.  Aborting.\n", argv[optind]);
-		return -EBUSY;
+		return 1;
 	}
 
 	root = open_fs(argv[optind], tree_location, super_mirror);

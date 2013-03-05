@@ -35,13 +35,12 @@
 #include "utils.h"
 #include "crc32c.h"
 
-static int verbose = 0;
 static u16 csum_size = 0;
 static u64 search_objectid = BTRFS_ROOT_TREE_OBJECTID;
 
 static void usage()
 {
-	fprintf(stderr, "Usage: find-roots [-v] <device>\n");
+	fprintf(stderr, "Usage: find-roots [-o search_objectid] <device>\n");
 }
 
 int csum_block(void *buf, u32 len)
@@ -64,32 +63,6 @@ int csum_block(void *buf, u32 len)
 		ret = 1;
 	free(result);
 	return ret;
-}
-
-static int __setup_root(u32 nodesize, u32 leafsize, u32 sectorsize,
-			u32 stripesize, struct btrfs_root *root,
-			struct btrfs_fs_info *fs_info, u64 objectid)
-{
-	root->node = NULL;
-	root->commit_root = NULL;
-	root->sectorsize = sectorsize;
-	root->nodesize = nodesize;
-	root->leafsize = leafsize;
-	root->stripesize = stripesize;
-	root->ref_cows = 0;
-	root->track_dirty = 0;
-
-	root->fs_info = fs_info;
-	root->objectid = objectid;
-	root->last_trans = 0;
-	root->highest_inode = 0;
-	root->last_inode_alloc = 0;
-
-	INIT_LIST_HEAD(&root->dirty_list);
-	memset(&root->root_key, 0, sizeof(root->root_key));
-	memset(&root->root_item, 0, sizeof(root->root_item));
-	root->root_key.objectid = objectid;
-	return 0;
 }
 
 static int close_all_devices(struct btrfs_fs_info *fs_info)
@@ -378,7 +351,8 @@ static int find_root(struct btrfs_root *root)
 			offset = metadata_offset;
 		}
 		err = __btrfs_map_block(&root->fs_info->mapping_tree, READ,
-				      offset, &map_length, &type, &multi, 0);
+				      offset, &map_length, &type,
+				      &multi, 0, NULL);
 		if (err) {
 			offset += map_length;
 			continue;
@@ -386,6 +360,7 @@ static int find_root(struct btrfs_root *root)
 
 		if (!(type & BTRFS_BLOCK_GROUP_METADATA)) {
 			offset += map_length;
+			kfree(multi);
 			continue;
 		}
 
@@ -414,11 +389,8 @@ int main(int argc, char **argv)
 	int opt;
 	int ret;
 
-	while ((opt = getopt(argc, argv, "vo:")) != -1) {
+	while ((opt = getopt(argc, argv, "o:")) != -1) {
 		switch(opt) {
-			case 'v':
-				verbose++;
-				break;
 			case 'o':
 				errno = 0;
 				search_objectid = (u64)strtoll(optarg, NULL,
@@ -448,8 +420,11 @@ int main(int argc, char **argv)
 
 	root = open_ctree_broken(dev_fd, argv[optind]);
 	close(dev_fd);
-	if (!root)
+
+	if (!root) {
+		fprintf(stderr, "Open ctree failed\n");
 		exit(1);
+	}
 
 	csum_size = btrfs_super_csum_size(&root->fs_info->super_copy);
 	ret = find_root(root);

@@ -1762,6 +1762,8 @@ static void set_avail_alloc_bits(struct btrfs_fs_info *fs_info, u64 flags)
 	u64 extra_flags = flags & (BTRFS_BLOCK_GROUP_RAID0 |
 				   BTRFS_BLOCK_GROUP_RAID1 |
 				   BTRFS_BLOCK_GROUP_RAID10 |
+				   BTRFS_BLOCK_GROUP_RAID5 |
+				   BTRFS_BLOCK_GROUP_RAID6 |
 				   BTRFS_BLOCK_GROUP_DUP);
 	if (extra_flags) {
 		if (flags & BTRFS_BLOCK_GROUP_DATA)
@@ -2408,6 +2410,8 @@ static int noinline find_free_extent(struct btrfs_trans_handle *trans,
 	WARN_ON(num_bytes < root->sectorsize);
 	btrfs_set_key_type(ins, BTRFS_EXTENT_ITEM_KEY);
 
+	search_start = stripe_align(root, search_start);
+
 	if (hint_byte) {
 		block_group = btrfs_lookup_first_block_group(info, hint_byte);
 		if (!block_group)
@@ -2423,6 +2427,7 @@ static int noinline find_free_extent(struct btrfs_trans_handle *trans,
 	total_needed += empty_size;
 
 check_failed:
+	search_start = stripe_align(root, search_start);
 	if (!block_group) {
 		block_group = btrfs_lookup_first_block_group(info,
 							     search_start);
@@ -2435,7 +2440,6 @@ check_failed:
 	if (ret)
 		goto error;
 
-	search_start = stripe_align(root, search_start);
 	ins->objectid = search_start;
 	ins->offset = num_bytes;
 
@@ -3406,7 +3410,7 @@ int btrfs_fix_block_accounting(struct btrfs_trans_handle *trans,
 	}
 
 	while(1) {
-		cache = btrfs_lookup_block_group(fs_info, start);
+		cache = btrfs_lookup_first_block_group(fs_info, start);
 		if (!cache)
 			break;
 		start = cache->key.objectid + cache->key.offset;

@@ -22,8 +22,11 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <sys/types.h>
 #include <sys/stat.h>
+#include <unistd.h>
 #include <getopt.h>
+#include <uuid/uuid.h>
 #include "kerncompat.h"
 #include "ctree.h"
 #include "volumes.h"
@@ -34,6 +37,7 @@
 #include "list.h"
 #include "version.h"
 #include "utils.h"
+#include "commands.h"
 
 static u64 bytes_used = 0;
 static u64 total_csum_bytes = 0;
@@ -96,6 +100,7 @@ struct inode_backref {
 	unsigned int found_inode_ref:1;
 	unsigned int filetype:8;
 	int errors;
+	unsigned int ref_type;
 	u64 dir;
 	u64 index;
 	u16 namelen;
@@ -469,12 +474,14 @@ static int add_inode_backref(struct cache_tree *inode_cache,
 
 		backref->filetype = filetype;
 		backref->found_dir_item = 1;
-	} else if (itemtype == BTRFS_INODE_REF_KEY) {
+	} else if ((itemtype == BTRFS_INODE_REF_KEY) ||
+		   (itemtype == BTRFS_INODE_EXTREF_KEY)) {
 		if (backref->found_inode_ref)
 			backref->errors |= REF_ERR_DUP_INODE_REF;
 		if (backref->found_dir_index && backref->index != index)
 			backref->errors |= REF_ERR_INDEX_UNMATCH;
 
+		backref->ref_type = itemtype;
 		backref->index = index;
 		backref->found_inode_ref = 1;
 	} else {
@@ -510,7 +517,7 @@ static int merge_inode_recs(struct inode_record *src, struct inode_record *dst,
 			add_inode_backref(dst_cache, dst->ino,
 					backref->dir, backref->index,
 					backref->name, backref->namelen, 0,
-					BTRFS_INODE_REF_KEY, backref->errors);
+					backref->ref_type, backref->errors);
 		}
 	}
 
@@ -914,6 +921,49 @@ static int process_inode_ref(struct extent_buffer *eb,
 	return 0;
 }
 
+static int process_inode_extref(struct extent_buffer *eb,
+				int slot, struct btrfs_key *key,
+				struct shared_node *active_node)
+{
+	u32 total;
+	u32 cur = 0;
+	u32 len;
+	u32 name_len;
+	u64 index;
+	u64 parent;
+	int error;
+	struct cache_tree *inode_cache;
+	struct btrfs_inode_extref *extref;
+	char namebuf[BTRFS_NAME_LEN];
+
+	inode_cache = &active_node->inode_cache;
+
+	extref = btrfs_item_ptr(eb, slot, struct btrfs_inode_extref);
+	total = btrfs_item_size_nr(eb, slot);
+	while (cur < total) {
+		name_len = btrfs_inode_extref_name_len(eb, extref);
+		index = btrfs_inode_extref_index(eb, extref);
+		parent = btrfs_inode_extref_parent(eb, extref);
+		if (name_len <= BTRFS_NAME_LEN) {
+			len = name_len;
+			error = 0;
+		} else {
+			len = BTRFS_NAME_LEN;
+			error = REF_ERR_NAME_TOO_LONG;
+		}
+		read_extent_buffer(eb, namebuf,
+				   (unsigned long)(extref + 1), len);
+		add_inode_backref(inode_cache, key->objectid, parent,
+				  index, namebuf, len, 0, key->type, error);
+
+		len = sizeof(*extref) + name_len;
+		extref = (struct btrfs_inode_extref *)((char *)extref + len);
+		cur += len;
+	}
+	return 0;
+
+}
+
 static u64 count_csum_range(struct btrfs_root *root, u64 start, u64 len)
 {
 	struct btrfs_key key;
@@ -1099,6 +1149,9 @@ static int process_one_leaf(struct btrfs_root *root, struct extent_buffer *eb,
 			break;
 		case BTRFS_INODE_REF_KEY:
 			ret = process_inode_ref(eb, i, &key, active_node);
+			break;
+		case BTRFS_INODE_EXTREF_KEY:
+			ret = process_inode_extref(eb, i, &key, active_node);
 			break;
 		case BTRFS_INODE_ITEM_KEY:
 			ret = process_inode_item(eb, i, &key, active_node);
@@ -1772,6 +1825,10 @@ static int check_fs_roots(struct btrfs_root *root,
 		    fs_root_objectid(key.objectid)) {
 			tmp_root = btrfs_read_fs_root_no_cache(root->fs_info,
 							       &key);
+			if (IS_ERR(tmp_root)) {
+				err = 1;
+				goto next;
+			}
 			ret = check_fs_root(tmp_root, root_cache, &wc);
 			if (ret)
 				err = 1;
@@ -1781,6 +1838,7 @@ static int check_fs_roots(struct btrfs_root *root,
 			process_root_ref(leaf, path.slots[0], &key,
 					 root_cache);
 		}
+next:
 		path.slots[0]++;
 	}
 	btrfs_release_path(tree_root, &path);
@@ -1918,8 +1976,10 @@ static int check_owner_ref(struct btrfs_root *root,
 	struct btrfs_root *ref_root;
 	struct btrfs_key key;
 	struct btrfs_path path;
+	struct extent_buffer *parent;
 	int level;
 	int found = 0;
+	int ret;
 
 	list_for_each_entry(node, &rec->backrefs, list) {
 		if (node->is_data)
@@ -1940,7 +2000,8 @@ static int check_owner_ref(struct btrfs_root *root,
 	key.offset = (u64)-1;
 
 	ref_root = btrfs_read_fs_root(root->fs_info, &key);
-	BUG_ON(IS_ERR(ref_root));
+	if (IS_ERR(ref_root))
+		return 1;
 
 	level = btrfs_header_level(buf);
 	if (level == 0)
@@ -1950,10 +2011,13 @@ static int check_owner_ref(struct btrfs_root *root,
 
 	btrfs_init_path(&path);
 	path.lowest_level = level + 1;
-	btrfs_search_slot(NULL, ref_root, &key, &path, 0, 0);
+	ret = btrfs_search_slot(NULL, ref_root, &key, &path, 0, 0);
+	if (ret < 0)
+		return 0;
 
-	if (buf->start == btrfs_node_blockptr(path.nodes[level + 1],
-					      path.slots[level + 1]))
+	parent = path.nodes[level + 1];
+	if (parent && buf->start == btrfs_node_blockptr(parent,
+							path.slots[level + 1]))
 		found = 1;
 
 	btrfs_release_path(ref_root, &path);
@@ -2588,7 +2652,6 @@ static int run_next_block(struct btrfs_root *root,
 	if (!extent_buffer_uptodate(buf)) {
 		record_bad_block_io(root->fs_info,
 				    extent_cache, bytenr, size);
-		free_extent_buffer(buf);
 		goto out;
 	}
 
@@ -2741,12 +2804,9 @@ out:
 }
 
 static int add_root_to_pending(struct extent_buffer *buf,
-			       struct block_info *bits,
-			       int bits_nr,
 			       struct cache_tree *extent_cache,
 			       struct cache_tree *pending,
 			       struct cache_tree *seen,
-			       struct cache_tree *reada,
 			       struct cache_tree *nodes,
 			       struct btrfs_key *root_key)
 {
@@ -3408,12 +3468,12 @@ static int check_extents(struct btrfs_trans_handle *trans,
 		exit(1);
 	}
 
-	add_root_to_pending(root->fs_info->tree_root->node, bits, bits_nr,
-			    &extent_cache, &pending, &seen, &reada, &nodes,
+	add_root_to_pending(root->fs_info->tree_root->node,
+			    &extent_cache, &pending, &seen, &nodes,
 			    &root->fs_info->tree_root->root_key);
 
-	add_root_to_pending(root->fs_info->chunk_root->node, bits, bits_nr,
-			    &extent_cache, &pending, &seen, &reada, &nodes,
+	add_root_to_pending(root->fs_info->chunk_root->node,
+			    &extent_cache, &pending, &seen, &nodes,
 			    &root->fs_info->chunk_root->root_key);
 
 	btrfs_init_path(&path);
@@ -3444,9 +3504,8 @@ static int check_extents(struct btrfs_trans_handle *trans,
 					      btrfs_root_bytenr(&ri),
 					      btrfs_level_size(root,
 					       btrfs_root_level(&ri)), 0);
-			add_root_to_pending(buf, bits, bits_nr, &extent_cache,
-					    &pending, &seen, &reada, &nodes,
-					    &found_key);
+			add_root_to_pending(buf, &extent_cache, &pending,
+					    &seen, &nodes, &found_key);
 			free_extent_buffer(buf);
 		}
 		path.slots[0]++;
@@ -3467,14 +3526,8 @@ static int check_extents(struct btrfs_trans_handle *trans,
 		root->fs_info->corrupt_blocks = NULL;
 	}
 
+	free(bits);
 	return ret;
-}
-
-static void print_usage(void)
-{
-	fprintf(stderr, "usage: btrfsck dev\n");
-	fprintf(stderr, "%s\n", BTRFS_BUILD_VERSION);
-	exit(1);
 }
 
 static struct option long_options[] = {
@@ -3485,13 +3538,25 @@ static struct option long_options[] = {
 	{ 0, 0, 0, 0}
 };
 
-int main(int ac, char **av)
+const char * const cmd_check_usage[] = {
+	"btrfs check [options] <device>",
+	"Check an unmounted btrfs filesystem.",
+	"",
+	"-s|--super <superblock>     use this superblock copy",
+	"--repair                    try to repair the filesystem",
+	"--init-csum-tree            create a new CRC tree",
+	"--init-extent-tree          create a new extent tree",
+	NULL
+};
+
+int cmd_check(int argc, char **argv)
 {
 	struct cache_tree root_cache;
 	struct btrfs_root *root;
 	struct btrfs_fs_info *info;
 	struct btrfs_trans_handle *trans = NULL;
 	u64 bytenr = 0;
+	char uuidbuf[37];
 	int ret;
 	int num;
 	int repair = 0;
@@ -3501,7 +3566,7 @@ int main(int ac, char **av)
 
 	while(1) {
 		int c;
-		c = getopt_long(ac, av, "as:", long_options,
+		c = getopt_long(argc, argv, "as:", long_options,
 				&option_index);
 		if (c < 0)
 			break;
@@ -3514,7 +3579,8 @@ int main(int ac, char **av)
 				       (unsigned long long)bytenr);
 				break;
 			case '?':
-				print_usage();
+			case 'h':
+				usage(cmd_check_usage);
 		}
 		if (option_index == 1) {
 			printf("enabling repair mode\n");
@@ -3527,23 +3593,25 @@ int main(int ac, char **av)
 		}
 
 	}
-	ac = ac - optind;
+	argc = argc - optind;
 
-	if (ac != 1)
-		print_usage();
+	if (argc != 1)
+		usage(cmd_check_usage);
 
 	radix_tree_init();
 	cache_tree_init(&root_cache);
 
-	if((ret = check_mounted(av[optind])) < 0) {
+	if((ret = check_mounted(argv[optind])) < 0) {
 		fprintf(stderr, "Could not check mount status: %s\n", strerror(-ret));
 		return ret;
 	} else if(ret) {
-		fprintf(stderr, "%s is currently mounted. Aborting.\n", av[optind]);
+		fprintf(stderr, "%s is currently mounted. Aborting.\n", argv[optind]);
 		return -EBUSY;
 	}
 
-	info = open_ctree_fs_info(av[optind], bytenr, rw, 1);
+	info = open_ctree_fs_info(argv[optind], bytenr, rw, 1);
+	uuid_unparse(info->super_copy.fsid, uuidbuf);
+	printf("Checking filesystem on %s\nUUID: %s\n", argv[optind], uuidbuf);
 
 	if (info == NULL)
 		return 1;

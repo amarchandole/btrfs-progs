@@ -754,7 +754,7 @@ static int scrub_write_progress(pthread_mutex_t *m, const char *fsid,
 {
 	int ret;
 	int err;
-	int fd = 0;
+	int fd = -1;
 	int old;
 
 	ret = pthread_mutex_lock(m);
@@ -782,7 +782,7 @@ static int scrub_write_progress(pthread_mutex_t *m, const char *fsid,
 		goto out;
 
 out:
-	if (fd > 0) {
+	if (fd >= 0) {
 		ret = close(fd);
 		if (ret)
 			err = -errno;
@@ -969,89 +969,6 @@ static struct scrub_file_record *last_dev_scrub(
 	return NULL;
 }
 
-static int scrub_device_info(int fd, u64 devid,
-			     struct btrfs_ioctl_dev_info_args *di_args)
-{
-	int ret;
-
-	di_args->devid = devid;
-	memset(&di_args->uuid, '\0', sizeof(di_args->uuid));
-
-	ret = ioctl(fd, BTRFS_IOC_DEV_INFO, di_args);
-	return ret ? -errno : 0;
-}
-
-static int scrub_fs_info(char *path,
-				struct btrfs_ioctl_fs_info_args *fi_args,
-				struct btrfs_ioctl_dev_info_args **di_ret)
-{
-	int ret = 0;
-	int ndevs = 0;
-	int i = 1;
-	int fd;
-	struct btrfs_fs_devices *fs_devices_mnt = NULL;
-	struct btrfs_ioctl_dev_info_args *di_args;
-	char mp[BTRFS_PATH_NAME_MAX + 1];
-
-	memset(fi_args, 0, sizeof(*fi_args));
-
-	fd  = open_file_or_dir(path);
-	if (fd < 0) {
-	       fprintf(stderr, "ERROR: can't access to '%s'\n", path);
-	       return -1;
-	}
-
-	ret = ioctl(fd, BTRFS_IOC_FS_INFO, fi_args);
-	if (ret && errno == EINVAL) {
-		/* path is no mounted btrfs. try if it's a device */
-		ret = check_mounted_where(fd, path, mp, sizeof(mp),
-						&fs_devices_mnt);
-		if (!ret)
-			return -EINVAL;
-		if (ret < 0)
-			return ret;
-		fi_args->num_devices = 1;
-		fi_args->max_id = fs_devices_mnt->latest_devid;
-		i = fs_devices_mnt->latest_devid;
-		memcpy(fi_args->fsid, fs_devices_mnt->fsid, BTRFS_FSID_SIZE);
-		close(fd);
-		fd = open_file_or_dir(mp);
-		if (fd < 0)
-			return -errno;
-	} else if (ret) {
-		close(fd);
-		return -errno;
-	}
-
-	if (!fi_args->num_devices) {
-		close(fd);
-		return 0;
-	}
-
-	di_args = *di_ret = malloc(fi_args->num_devices * sizeof(*di_args));
-	if (!di_args) {
-		close(fd);
-		return -errno;
-	}
-
-	for (; i <= fi_args->max_id; ++i) {
-		BUG_ON(ndevs >= fi_args->num_devices);
-		ret = scrub_device_info(fd, i, &di_args[ndevs]);
-		if (ret == -ENODEV)
-			continue;
-		if (ret) {
-			close(fd);
-			return ret;
-		}
-		++ndevs;
-	}
-
-	BUG_ON(ndevs == 0);
-
-	close(fd);
-	return 0;
-}
-
 int mkdir_p(char *path)
 {
 	int i;
@@ -1172,7 +1089,7 @@ static int scrub_start(int argc, char **argv, int resume)
 		return 12;
 	}
 
-	ret = scrub_fs_info(path, &fi_args, &di_args);
+	ret = get_fs_info(fdmnt, path, &fi_args, &di_args);
 	if (ret) {
 		ERR(!do_quiet, "ERROR: getting dev info for scrub failed: "
 		    "%s\n", strerror(-ret));
@@ -1275,6 +1192,7 @@ static int scrub_start(int argc, char **argv, int resume)
 			/* ... yes, so scrub must be running. error out */
 			fprintf(stderr, "ERROR: scrub already running\n");
 			close(prg_fd);
+			prg_fd = -1;
 			goto out;
 		}
 		/*
@@ -1539,14 +1457,14 @@ static int cmd_scrub_cancel(int argc, char **argv)
 again:
 	ret = ioctl(fdmnt, BTRFS_IOC_SCRUB_CANCEL, NULL);
 	err = errno;
-	close(fdmnt);
 
 	if (ret && err == EINVAL) {
-		/* path is no mounted btrfs. try if it's a device */
+		/* path is not a btrfs mount point.  See if it's a device. */
 		ret = check_mounted_where(fdmnt, path, mp, sizeof(mp),
 					  &fs_devices_mnt);
-		close(fdmnt);
 		if (ret) {
+			/* It is a device; open the mountpoint. */
+			close(fdmnt);
 			fdmnt = open_file_or_dir(mp);
 			if (fdmnt >= 0) {
 				path = mp;
@@ -1554,6 +1472,8 @@ again:
 			}
 		}
 	}
+
+	close(fdmnt);
 
 	if (ret) {
 		fprintf(stderr, "ERROR: scrub cancel failed on %s: %s\n", path,
@@ -1604,6 +1524,7 @@ static int cmd_scrub_status(int argc, char **argv)
 	};
 	int ret;
 	int i;
+	int fdmnt;
 	int print_raw = 0;
 	int do_stats_per_dev = 0;
 	int c;
@@ -1631,7 +1552,13 @@ static int cmd_scrub_status(int argc, char **argv)
 
 	path = argv[optind];
 
-	ret = scrub_fs_info(path, &fi_args, &di_args);
+	fdmnt = open_file_or_dir(path);
+	if (fdmnt < 0) {
+		fprintf(stderr, "ERROR: can't access to '%s'\n", path);
+		return 12;
+	}
+
+	ret = get_fs_info(fdmnt, path, &fi_args, &di_args);
 	if (ret) {
 		fprintf(stderr, "ERROR: getting dev info for scrub failed: "
 				"%s\n", strerror(-ret));
@@ -1660,6 +1587,7 @@ static int cmd_scrub_status(int argc, char **argv)
 	addr.sun_path[sizeof(addr.sun_path) - 1] = '\0';
 	ret = connect(fdres, (struct sockaddr *)&addr, sizeof(addr));
 	if (ret == -1) {
+		close(fdres);
 		fdres = scrub_open_file_r(SCRUB_DATA_FILE, fsid);
 		if (fdres < 0 && fdres != -ENOENT) {
 			fprintf(stderr, "WARNING: failed to open status file: "

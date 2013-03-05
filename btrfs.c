@@ -246,11 +246,14 @@ const struct cmd_group btrfs_cmd_group = {
 		{ "balance", cmd_balance, NULL, &balance_cmd_group, 0 },
 		{ "device", cmd_device, NULL, &device_cmd_group, 0 },
 		{ "scrub", cmd_scrub, NULL, &scrub_cmd_group, 0 },
+		{ "check", cmd_check, cmd_check_usage, NULL, 0 },
+		{ "restore", cmd_restore, cmd_restore_usage, NULL, 0 },
 		{ "inspect-internal", cmd_inspect, NULL, &inspect_cmd_group, 0 },
-		{ "send", cmd_send, NULL, &send_cmd_group, 0 },
-		{ "receive", cmd_receive, NULL, &receive_cmd_group, 0 },
+		{ "send", cmd_send, cmd_send_usage, NULL, 0 },
+		{ "receive", cmd_receive, cmd_receive_usage, NULL, 0 },
 		{ "quota", cmd_quota, NULL, &quota_cmd_group, 0 },
 		{ "qgroup", cmd_qgroup, NULL, &qgroup_cmd_group, 0 },
+		{ "replace", cmd_replace, NULL, &replace_cmd_group, 0 },
 		{ "help", cmd_help, cmd_help_usage, NULL, 0 },
 		{ "version", cmd_version, cmd_version_usage, NULL, 0 },
 		{ 0, 0, 0, 0, 0 }
@@ -260,23 +263,33 @@ const struct cmd_group btrfs_cmd_group = {
 int main(int argc, char **argv)
 {
 	const struct cmd_struct *cmd;
+	const char *bname;
 
-	crc32c_optimization_init();
+	if ((bname = strrchr(argv[0], '/')) != NULL)
+		bname++;
+	else
+		bname = argv[0];
 
-	argc--;
-	argv++;
-	handle_options(&argc, &argv);
-	if (argc > 0) {
-		if (!prefixcmp(argv[0], "--"))
-			argv[0] += 2;
+	if (!strcmp(bname, "btrfsck")) {
+		argv[0] = "check";
 	} else {
-		usage_command_group(&btrfs_cmd_group, 0, 0);
-		exit(1);
+		argc--;
+		argv++;
+		handle_options(&argc, &argv);
+		if (argc > 0) {
+			if (!prefixcmp(argv[0], "--"))
+				argv[0] += 2;
+		} else {
+			usage_command_group(&btrfs_cmd_group, 0, 0);
+			exit(1);
+		}
 	}
 
 	cmd = parse_command_token(argv[0], &btrfs_cmd_group);
 
 	handle_help_options_next_level(cmd, argc, argv);
+
+	crc32c_optimization_init();
 
 	fixup_argv0(argv, cmd->token);
 	exit(cmd->fn(argc, argv));

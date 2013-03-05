@@ -39,6 +39,8 @@
 #include <linux/fs.h>
 #include <ctype.h>
 #include <attr/xattr.h>
+#include <blkid/blkid.h>
+#include <ftw.h>
 #include "ctree.h"
 #include "disk-io.h"
 #include "volumes.h"
@@ -204,10 +206,11 @@ static int create_one_raid_group(struct btrfs_trans_handle *trans,
 static int create_raid_groups(struct btrfs_trans_handle *trans,
 			      struct btrfs_root *root, u64 data_profile,
 			      int data_profile_opt, u64 metadata_profile,
-			      int metadata_profile_opt, int mixed)
+			      int metadata_profile_opt, int mixed, int ssd)
 {
 	u64 num_devices = btrfs_super_num_devices(&root->fs_info->super_copy);
-	u64 allowed;
+	u64 allowed = 0;
+	u64 devices_for_raid = num_devices;
 	int ret;
 
 	/*
@@ -215,21 +218,34 @@ static int create_raid_groups(struct btrfs_trans_handle *trans,
 	 * For mixed groups defaults are single/single.
 	 */
 	if (!metadata_profile_opt && !mixed) {
+		if (num_devices == 1 && ssd)
+			printf("Detected a SSD, turning off metadata "
+			       "duplication.  Mkfs with -m dup if you want to "
+			       "force metadata duplication.\n");
 		metadata_profile = (num_devices > 1) ?
-			BTRFS_BLOCK_GROUP_RAID1 : BTRFS_BLOCK_GROUP_DUP;
+			BTRFS_BLOCK_GROUP_RAID1 : (ssd) ? 0: BTRFS_BLOCK_GROUP_DUP;
 	}
 	if (!data_profile_opt && !mixed) {
 		data_profile = (num_devices > 1) ?
 			BTRFS_BLOCK_GROUP_RAID0 : 0; /* raid0 or single */
 	}
 
-	if (num_devices == 1)
-		allowed = BTRFS_BLOCK_GROUP_DUP;
-	else if (num_devices >= 4) {
-		allowed = BTRFS_BLOCK_GROUP_RAID0 | BTRFS_BLOCK_GROUP_RAID1 |
-			BTRFS_BLOCK_GROUP_RAID10;
-	} else
-		allowed = BTRFS_BLOCK_GROUP_RAID0 | BTRFS_BLOCK_GROUP_RAID1;
+	if (devices_for_raid > 4)
+		devices_for_raid = 4;
+
+	switch (devices_for_raid) {
+	default:
+	case 4:
+		allowed |= BTRFS_BLOCK_GROUP_RAID10;
+	case 3:
+		allowed |= BTRFS_BLOCK_GROUP_RAID6;
+	case 2:
+		allowed |= BTRFS_BLOCK_GROUP_RAID0 | BTRFS_BLOCK_GROUP_RAID1 |
+			BTRFS_BLOCK_GROUP_RAID5;
+		break;
+	case 1:
+		allowed |= BTRFS_BLOCK_GROUP_DUP;
+	}
 
 	if (metadata_profile & ~allowed) {
 		fprintf(stderr,	"unable to create FS with metadata "
@@ -336,6 +352,10 @@ static u64 parse_profile(char *s)
 		return BTRFS_BLOCK_GROUP_RAID0;
 	} else if (strcmp(s, "raid1") == 0) {
 		return BTRFS_BLOCK_GROUP_RAID1;
+	} else if (strcmp(s, "raid5") == 0) {
+		return BTRFS_BLOCK_GROUP_RAID5;
+	} else if (strcmp(s, "raid6") == 0) {
+		return BTRFS_BLOCK_GROUP_RAID6;
 	} else if (strcmp(s, "raid10") == 0) {
 		return BTRFS_BLOCK_GROUP_RAID10;
 	} else if (strcmp(s, "dup") == 0) {
@@ -352,19 +372,12 @@ static u64 parse_profile(char *s)
 
 static char *parse_label(char *input)
 {
-	int i;
 	int len = strlen(input);
 
 	if (len >= BTRFS_LABEL_SIZE) {
 		fprintf(stderr, "Label %s is too long (max %d)\n", input,
 			BTRFS_LABEL_SIZE - 1);
 		exit(1);
-	}
-	for (i = 0; i < len; i++) {
-		if (input[i] == '/' || input[i] == '\\') {
-			fprintf(stderr, "invalid label %s\n", input);
-			exit(1);
-		}
 	}
 	return strdup(input);
 }
@@ -782,7 +795,7 @@ static int add_file_items(struct btrfs_trans_handle *trans,
 	fd = open(path_name, O_RDONLY);
 	if (fd == -1) {
 		fprintf(stderr, "%s open failed\n", path_name);
-		goto end;
+		return ret;
 	}
 
 	blocks = st->st_size / sectorsize;
@@ -1099,16 +1112,30 @@ fail:
 	return -1;
 }
 
+/*
+ * This ignores symlinks with unreadable targets and subdirs that can't
+ * be read.  It's a best-effort to give a rough estimate of the size of
+ * a subdir.  It doesn't guarantee that prepopulating btrfs from this
+ * tree won't still run out of space. 
+ *
+ * The rounding up to 4096 is questionable.  Previous code used du -B 4096.
+ */
+static u64 global_total_size;
+static int ftw_add_entry_size(const char *fpath, const struct stat *st,
+			      int type)
+{
+	if (type == FTW_F || type == FTW_D)
+		global_total_size += round_up(st->st_size, 4096);
+
+	return 0;
+}
+
 static u64 size_sourcedir(char *dir_name, u64 sectorsize,
 			  u64 *num_of_meta_chunks_ret, u64 *size_of_data_ret)
 {
 	u64 dir_size = 0;
 	u64 total_size = 0;
 	int ret;
-	char command[1024];
-	char path[512];
-	char *file_name = "temp_file";
-	FILE *file;
 	u64 default_chunk_size = 8 * 1024 * 1024;	/* 8MB */
 	u64 allocated_meta_size = 8 * 1024 * 1024;	/* 8MB */
 	u64 allocated_total_size = 20 * 1024 * 1024;	/* 20MB */
@@ -1116,23 +1143,14 @@ static u64 size_sourcedir(char *dir_name, u64 sectorsize,
 	u64 num_of_allocated_meta_chunks =
 			allocated_meta_size / default_chunk_size;
 
-	ret = sprintf(command, "du -B 4096 -s ");
+	global_total_size = 0;
+	ret = ftw(dir_name, ftw_add_entry_size, 10);
+	dir_size = global_total_size;
 	if (ret < 0) {
-		fprintf(stderr, "error executing sprintf for du command\n");
-		return -1;
+		fprintf(stderr, "ftw subdir walk of '%s' failed: %s\n",
+			dir_name, strerror(errno));
+		exit(1);
 	}
-	strcat(command, dir_name);
-	strcat(command, " > ");
-	strcat(command, file_name);
-	ret = system(command);
-
-	file = fopen(file_name, "r");
-	ret = fscanf(file, "%lld %s\n", &dir_size, path);
-	fclose(file);
-	remove(file_name);
-
-	dir_size *= sectorsize;
-	*size_of_data_ret = dir_size;
 
 	num_of_meta_chunks = (dir_size / 2) / default_chunk_size;
 	if (((dir_size / 2) % default_chunk_size) != 0)
@@ -1193,6 +1211,134 @@ static int check_leaf_or_node_size(u32 size, u32 sectorsize)
 	return 0;
 }
 
+static int is_ssd(const char *file)
+{
+	char *devname;
+	blkid_probe probe;
+	char *dev;
+	char path[PATH_MAX];
+	dev_t disk;
+	int fd;
+	char rotational;
+
+	probe = blkid_new_probe_from_filename(file);
+	if (!probe)
+		return 0;
+
+	/*
+	 * We want to use blkid_devno_to_wholedisk() but it's broken for some
+	 * reason on F17 at least so we'll do this trickery
+	 */
+	disk = blkid_probe_get_wholedisk_devno(probe);
+	if (!disk)
+		return 0;
+
+	devname = blkid_devno_to_devname(disk);
+	if (!devname)
+		return 0;
+
+	dev = strrchr(devname, '/');
+	dev++;
+
+	snprintf(path, PATH_MAX, "/sys/block/%s/queue/rotational", dev);
+
+	free(devname);
+	blkid_free_probe(probe);
+
+	fd = open(path, O_RDONLY);
+	if (fd < 0) {
+		return 0;
+	}
+
+	if (read(fd, &rotational, sizeof(char)) < sizeof(char)) {
+		close(fd);
+		return 0;
+	}
+	close(fd);
+
+	return !atoi((const char *)&rotational);
+}
+
+/*
+ * Check for existing filesystem or partition table on device.
+ * Returns:
+ *	 1 for existing fs or partition
+ *	 0 for nothing found
+ *	-1 for internal error
+ */
+static int
+check_overwrite(
+	char		*device)
+{
+	const char	*type;
+	blkid_probe	pr = NULL;
+	int		ret;
+	blkid_loff_t	size;
+
+	if (!device || !*device)
+		return 0;
+
+	ret = -1; /* will reset on success of all setup calls */
+
+	pr = blkid_new_probe_from_filename(device);
+	if (!pr)
+		goto out;
+
+	size = blkid_probe_get_size(pr);
+	if (size < 0)
+		goto out;
+
+	/* nothing to overwrite on a 0-length device */
+	if (size == 0) {
+		ret = 0;
+		goto out;
+	}
+
+	ret = blkid_probe_enable_partitions(pr, 1);
+	if (ret < 0)
+		goto out;
+
+	ret = blkid_do_fullprobe(pr);
+	if (ret < 0)
+		goto out;
+
+	/*
+	 * Blkid returns 1 for nothing found and 0 when it finds a signature,
+	 * but we want the exact opposite, so reverse the return value here.
+	 *
+	 * In addition print some useful diagnostics about what actually is
+	 * on the device.
+	 */
+	if (ret) {
+		ret = 0;
+		goto out;
+	}
+
+	if (!blkid_probe_lookup_value(pr, "TYPE", &type, NULL)) {
+		fprintf(stderr,
+			"%s appears to contain an existing "
+			"filesystem (%s).\n", device, type);
+	} else if (!blkid_probe_lookup_value(pr, "PTTYPE", &type, NULL)) {
+		fprintf(stderr,
+			"%s appears to contain a partition "
+			"table (%s).\n", device, type);
+	} else {
+		fprintf(stderr,
+			"%s appears to contain something weird "
+			"according to blkid\n", device);
+	}
+	ret = 1;
+
+out:
+	if (pr)
+		blkid_free_probe(pr);
+	if (ret == -1)
+		fprintf(stderr,
+			"probe of %s failed, cannot detect "
+			  "existing filesystem.\n", device);
+	return ret;
+}
+
 int main(int ac, char **av)
 {
 	char *file;
@@ -1206,7 +1352,7 @@ int main(int ac, char **av)
 	u64 alloc_start = 0;
 	u64 metadata_profile = 0;
 	u64 data_profile = 0;
-	u32 leafsize = getpagesize();
+	u32 leafsize = sysconf(_SC_PAGESIZE);
 	u32 sectorsize = 4096;
 	u32 nodesize = leafsize;
 	u32 stripesize = 4096;
@@ -1219,6 +1365,8 @@ int main(int ac, char **av)
 	int data_profile_opt = 0;
 	int metadata_profile_opt = 0;
 	int nodiscard = 0;
+	int ssd = 0;
+	int force_overwrite = 0;
 
 	char *source_dir = NULL;
 	int source_dir_set = 0;
@@ -1226,16 +1374,21 @@ int main(int ac, char **av)
 	u64 size_of_data = 0;
 	u64 source_dir_size = 0;
 	char *pretty_buf;
+	struct btrfs_super_block *super;
+	u64 flags;
 
 	while(1) {
 		int c;
-		c = getopt_long(ac, av, "A:b:l:n:s:m:d:L:r:VMK", long_options,
+		c = getopt_long(ac, av, "A:b:fl:n:s:m:d:L:r:VMK", long_options,
 				&option_index);
 		if (c < 0)
 			break;
 		switch(c) {
 			case 'A':
 				alloc_start = parse_size(optarg);
+				break;
+			case 'f':
+				force_overwrite = 1;
 				break;
 			case 'd':
 				data_profile = parse_profile(optarg);
@@ -1282,7 +1435,7 @@ int main(int ac, char **av)
 				print_usage();
 		}
 	}
-	sectorsize = max(sectorsize, (u32)getpagesize());
+	sectorsize = max(sectorsize, (u32)sysconf(_SC_PAGESIZE));
 	if (check_leaf_or_node_size(leafsize, sectorsize))
 		exit(1);
 	if (check_leaf_or_node_size(nodesize, sectorsize))
@@ -1296,6 +1449,22 @@ int main(int ac, char **av)
 
 	if (source_dir == 0) {
 		file = av[optind++];
+		ret = is_swap_device(file);
+		if (ret < 0) {
+			fprintf(stderr, "error checking %s status: %s\n", file,
+				strerror(-ret));
+			exit(1);
+		}
+		if (ret == 1) {
+			fprintf(stderr, "%s is a swap device\n", file);
+			exit(1);
+		}
+		if (!force_overwrite) {
+			if (check_overwrite(file)) {
+				fprintf(stderr, "Use the -f option to force overwrite.\n");
+				exit(1);
+			}
+		}
 		ret = check_mounted(file);
 		if (ret < 0) {
 			fprintf(stderr, "error checking %s mount status\n", file);
@@ -1306,9 +1475,23 @@ int main(int ac, char **av)
 			exit(1);
 		}
 		ac--;
+		/* check if the device is busy */
+		fd = open(file, O_RDWR|O_EXCL);
+		if (fd < 0) {
+			fprintf(stderr, "unable to open %s: %s\n", file,
+				strerror(errno));
+			exit(1);
+		}
+		close(fd);
+		/*
+		 * open again without O_EXCL so that the problem should not
+		 * occur by the following processing.
+		 * (btrfs_register_one_device() fails if O_EXCL is on)
+		 */
 		fd = open(file, O_RDWR);
 		if (fd < 0) {
-			fprintf(stderr, "unable to open %s\n", file);
+			fprintf(stderr, "unable to open %s: %s\n", file,
+				strerror(errno));
 			exit(1);
 		}
 		first_file = file;
@@ -1337,7 +1520,12 @@ int main(int ac, char **av)
 			fprintf(stderr, "unable to zero the output file\n");
 			exit(1);
 		}
+		/* our "device" is the new image file */
+		dev_block_count = block_count;
 	}
+
+	ssd = is_ssd(file);
+
 	if (mixed) {
 		if (metadata_profile != data_profile) {
 			fprintf(stderr, "With mixed block groups data and metadata "
@@ -1362,7 +1550,8 @@ int main(int ac, char **av)
 
 	root = open_ctree(file, 0, O_RDWR);
 	if (!root) {
-		fprintf(stderr, "ctree init failed\n");
+		fprintf(stderr, "Open ctree failed\n");
+		close(fd);
 		exit(1);
 	}
 	root->fs_info->alloc_start = alloc_start;
@@ -1385,6 +1574,23 @@ int main(int ac, char **av)
 		int old_mixed = mixed;
 
 		file = av[optind++];
+		if (!force_overwrite) {
+			if (check_overwrite(file)) {
+				fprintf(stderr, "Use the -f option to force overwrite.\n");
+				exit(1);
+			}
+		}
+
+		ret = is_swap_device(file);
+		if (ret < 0) {
+			fprintf(stderr, "error checking %s status: %s\n", file,
+				strerror(-ret));
+			exit(1);
+		}
+		if (ret == 1) {
+			fprintf(stderr, "%s is a swap device\n", file);
+			exit(1);
+		}
 		ret = check_mounted(file);
 		if (ret < 0) {
 			fprintf(stderr, "error checking %s mount status\n",
@@ -1395,9 +1601,23 @@ int main(int ac, char **av)
 			fprintf(stderr, "%s is mounted\n", file);
 			exit(1);
 		}
+		/* check if the device is busy */
+		fd = open(file, O_RDWR|O_EXCL);
+		if (fd < 0) {
+			fprintf(stderr, "unable to open %s: %s\n", file,
+				strerror(errno));
+			exit(1);
+		}
+		close(fd);
+		/*
+		 * open again without O_EXCL so that the problem should not
+		 * occur by the following processing.
+		 * (btrfs_register_one_device() fails if O_EXCL is on)
+		 */
 		fd = open(file, O_RDWR);
 		if (fd < 0) {
-			fprintf(stderr, "unable to open %s\n", file);
+			fprintf(stderr, "unable to open %s: %s\n", file,
+				strerror(errno));
 			exit(1);
 		}
 		ret = btrfs_device_already_in_root(root, fd,
@@ -1423,19 +1643,30 @@ raid_groups:
 	if (!source_dir_set) {
 		ret = create_raid_groups(trans, root, data_profile,
 				 data_profile_opt, metadata_profile,
-				 metadata_profile_opt, mixed);
+				 metadata_profile_opt, mixed, ssd);
 		BUG_ON(ret);
 	}
 
 	ret = create_data_reloc_tree(trans, root);
 	BUG_ON(ret);
 
-	if (mixed) {
+	super = &root->fs_info->super_copy;
+	flags = btrfs_super_incompat_flags(super);
+	flags |= BTRFS_FEATURE_INCOMPAT_EXTENDED_IREF;
+
+	if (mixed)
+		flags |= BTRFS_FEATURE_INCOMPAT_MIXED_GROUPS;
+
+	btrfs_set_super_incompat_flags(super, flags);
+
+	if ((data_profile | metadata_profile) &
+	    (BTRFS_BLOCK_GROUP_RAID5 | BTRFS_BLOCK_GROUP_RAID6)) {
 		struct btrfs_super_block *super = &root->fs_info->super_copy;
 		u64 flags = btrfs_super_incompat_flags(super);
 
-		flags |= BTRFS_FEATURE_INCOMPAT_MIXED_GROUPS;
+		flags |= BTRFS_FEATURE_INCOMPAT_RAID56;
 		btrfs_set_super_incompat_flags(super, flags);
+		printf("Setting RAID5/6 feature flag\n");
 	}
 
 	printf("fs created label %s on %s\n\tnodesize %u leafsize %u "

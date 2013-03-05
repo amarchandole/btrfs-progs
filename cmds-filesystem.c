@@ -148,6 +148,12 @@ static int cmd_df(int argc, char **argv)
 		} else if (flags & BTRFS_BLOCK_GROUP_RAID10) {
 			snprintf(description+written, 9, "%s", ", RAID10");
 			written += 8;
+		} else if (flags & BTRFS_BLOCK_GROUP_RAID5) {
+			snprintf(description+written, 9, "%s", ", RAID5");
+			written += 7;
+		} else if (flags & BTRFS_BLOCK_GROUP_RAID6) {
+			snprintf(description+written, 9, "%s", ", RAID6");
+			written += 7;
 		}
 
 		total_bytes = pretty_sizes(sargs->spaces[i].total_bytes);
@@ -464,11 +470,6 @@ static int cmd_resize(int argc, char **argv)
 	amount = argv[1];
 	path = argv[2];
 
-	fd = open_file_or_dir(path);
-	if (fd < 0) {
-		fprintf(stderr, "ERROR: can't access to '%s'\n", path);
-		return 12;
-	}
 	len = strlen(amount);
 	if (len == 0 || len >= BTRFS_VOL_NAME_MAX) {
 		fprintf(stderr, "ERROR: size value too long ('%s)\n",
@@ -476,9 +477,14 @@ static int cmd_resize(int argc, char **argv)
 		return 14;
 	}
 
+	fd = open_file_or_dir(path);
+	if (fd < 0) {
+		fprintf(stderr, "ERROR: can't access to '%s'\n", path);
+		return 12;
+	}
+
 	printf("Resize '%s' of '%s'\n", path, amount);
-	strncpy(args.name, amount, BTRFS_PATH_NAME_MAX);
-	args.name[BTRFS_PATH_NAME_MAX-1] = 0;
+	strncpy_null(args.name, amount);
 	res = ioctl(fd, BTRFS_IOC_RESIZE, &args);
 	e = errno;
 	close(fd);

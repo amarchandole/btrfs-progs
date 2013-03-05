@@ -28,6 +28,7 @@
 #include "volumes.h"
 
 #include "commands.h"
+#include "utils.h"
 
 static const char * const balance_cmd_group_usage[] = {
 	"btrfs [filesystem] balance <command> [options] <path>",
@@ -47,6 +48,10 @@ static int parse_one_profile(const char *profile, u64 *flags)
 		*flags |= BTRFS_BLOCK_GROUP_RAID1;
 	} else if (!strcmp(profile, "raid10")) {
 		*flags |= BTRFS_BLOCK_GROUP_RAID10;
+	} else if (!strcmp(profile, "raid5")) {
+		*flags |= BTRFS_BLOCK_GROUP_RAID5;
+	} else if (!strcmp(profile, "raid6")) {
+		*flags |= BTRFS_BLOCK_GROUP_RAID6;
 	} else if (!strcmp(profile, "dup")) {
 		*flags |= BTRFS_BLOCK_GROUP_DUP;
 	} else if (!strcmp(profile, "single")) {
@@ -159,7 +164,7 @@ static int parse_filters(char *filters, struct btrfs_balance_args *args)
 				return 1;
 			}
 			if (parse_u64(value, &args->usage) ||
-			    args->usage < 1 || args->usage > 100) {
+			    args->usage > 100) {
 				fprintf(stderr, "Invalid usage argument: %s\n",
 				       value);
 				return 1;
@@ -349,7 +354,7 @@ static const char * const cmd_balance_start_usage[] = {
 	"",
 	"-d[filters]    act on data chunks",
 	"-m[filters]    act on metadata chunks",
-	"-s[filetrs]    act on system chunks (only under -f)",
+	"-s[filters]    act on system chunks (only under -f)",
 	"-v             be verbose",
 	"-f             force reducing of metadata integrity",
 	NULL

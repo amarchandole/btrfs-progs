@@ -18,6 +18,10 @@
 #ifndef SEND_STREAM_H_
 #define SEND_STREAM_H_
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 struct btrfs_send_ops {
 	int (*subvol)(const char *path, const u8 *uuid, u64 ctransid,
 		      void *user);
@@ -49,10 +53,14 @@ struct btrfs_send_ops {
 	int (*utimes)(const char *path, struct timespec *at,
 		      struct timespec *mt, struct timespec *ct,
 		      void *user);
+	int (*update_extent)(const char *path, u64 offset, u64 len, void *user);
 };
 
 int btrfs_read_and_process_send_stream(int fd,
 				       struct btrfs_send_ops *ops, void *user);
 
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* SEND_STREAM_H_ */
