@@ -32,7 +32,6 @@
 #include "version.h"
 
 #include "commands.h"
-#include "btrfslabel.h"
 
 static const char * const filesystem_cmd_group_usage[] = {
 	"btrfs filesystem [<group>] <command> [<args>]",
@@ -497,8 +496,8 @@ static int cmd_resize(int argc, char **argv)
 }
 
 static const char * const cmd_label_usage[] = {
-	"btrfs filesystem label <device> [<newlabel>]",
-	"Get or change the label of an unmounted filesystem",
+	"btrfs filesystem label [<device>|<mountpoint>] [<newlabel>]",
+	"Get or change the label of a filesystem",
 	"With one argument, get the label of filesystem on <device>.",
 	"If <newlabel> is passed, set the filesystem label to <newlabel>.",
 	NULL

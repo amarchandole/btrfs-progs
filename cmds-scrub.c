@@ -287,7 +287,11 @@ static void free_history(struct scrub_file_record **last_scrubs)
 static int cancel_fd = -1;
 static void scrub_sigint_record_progress(int signal)
 {
-	ioctl(cancel_fd, BTRFS_IOC_SCRUB_CANCEL, NULL);
+	int ret;
+
+	ret = ioctl(cancel_fd, BTRFS_IOC_SCRUB_CANCEL, NULL);
+	if (ret < 0)
+		perror("Scrub cancel failed");
 }
 
 static int scrub_handle_sigint_parent(void)
@@ -759,7 +763,7 @@ static int scrub_write_progress(pthread_mutex_t *m, const char *fsid,
 
 	ret = pthread_mutex_lock(m);
 	if (ret) {
-		err = -errno;
+		err = -ret;
 		goto out;
 	}
 
@@ -836,9 +840,11 @@ static void *progress_one_dev(void *ctx)
 	return NULL;
 }
 
+/* nb: returns a negative errno via ERR_PTR */
 static void *scrub_progress_cycle(void *ctx)
 {
 	int ret;
+	int  perr = 0;	/* positive / pthread error returns */
 	int old;
 	int i;
 	char fsid[37];
@@ -863,9 +869,9 @@ static void *scrub_progress_cycle(void *ctx)
 	struct sockaddr_un peer;
 	socklen_t peer_size = sizeof(peer);
 
-	ret = pthread_setcanceltype(PTHREAD_CANCEL_ASYNCHRONOUS, &old);
-	if (ret)
-		return ERR_PTR(-ret);
+	perr = pthread_setcanceltype(PTHREAD_CANCEL_ASYNCHRONOUS, &old);
+	if (perr)
+		goto out;
 
 	uuid_unparse(spc->fi->fsid, fsid);
 
@@ -886,8 +892,10 @@ static void *scrub_progress_cycle(void *ctx)
 
 	while (1) {
 		ret = poll(&accept_poll_fd, 1, 5 * 1000);
-		if (ret == -1)
-			return ERR_PTR(-errno);
+		if (ret == -1) {
+			ret = -errno;
+			goto out;
+		}
 		if (ret)
 			peer_fd = accept(spc->prg_fd, (struct sockaddr *)&peer,
 					 &peer_size);
@@ -905,42 +913,46 @@ static void *scrub_progress_cycle(void *ctx)
 			if (!sp->ret)
 				continue;
 			if (sp->ioctl_errno != ENOTCONN &&
-			    sp->ioctl_errno != ENODEV)
-				return ERR_PTR(-sp->ioctl_errno);
+			    sp->ioctl_errno != ENODEV) {
+				ret = -sp->ioctl_errno;
+				goto out;
+			}
 			/*
 			 * scrub finished or device removed, check the
 			 * finished flag. if unset, just use the last
 			 * result we got for the current write and go
 			 * on. flag should be set on next cycle, then.
 			 */
-			ret = pthread_mutex_lock(&sp_shared->progress_mutex);
-			if (ret)
-				return ERR_PTR(-ret);
+			perr = pthread_mutex_lock(&sp_shared->progress_mutex);
+			if (perr)
+				goto out;
 			if (!sp_shared->stats.finished) {
-				ret = pthread_mutex_unlock(
+				perr = pthread_mutex_unlock(
 						&sp_shared->progress_mutex);
-				if (ret)
-					return ERR_PTR(-ret);
+				if (perr)
+					goto out;
 				memcpy(sp, sp_last, sizeof(*sp));
 				continue;
 			}
-			ret = pthread_mutex_unlock(&sp_shared->progress_mutex);
-			if (ret)
-				return ERR_PTR(-ret);
+			perr = pthread_mutex_unlock(&sp_shared->progress_mutex);
+			if (perr)
+				goto out;
 			memcpy(sp, sp_shared, sizeof(*sp));
 			memcpy(sp_last, sp_shared, sizeof(*sp));
 		}
 		if (peer_fd != -1) {
 			write_poll_fd.fd = peer_fd;
 			ret = poll(&write_poll_fd, 1, 0);
-			if (ret == -1)
-				return ERR_PTR(-errno);
+			if (ret == -1) {
+				ret = -errno;
+				goto out;
+			}
 			if (ret) {
 				ret = scrub_write_file(
 					peer_fd, fsid,
 					&spc->progress[this * ndev], ndev);
 				if (ret)
-					return ERR_PTR(ret);
+					goto out;
 			}
 			close(peer_fd);
 			peer_fd = -1;
@@ -950,8 +962,14 @@ static void *scrub_progress_cycle(void *ctx)
 		ret = scrub_write_progress(spc->write_mutex, fsid,
 					   &spc->progress[this * ndev], ndev);
 		if (ret)
-			return ERR_PTR(ret);
+			goto out;
 	}
+out:
+	if (peer_fd != -1)
+		close(peer_fd);
+	if (perr)
+		ret = -perr;
+	return ERR_PTR(ret);
 }
 
 static struct scrub_file_record *last_dev_scrub(
@@ -1083,13 +1101,14 @@ static int scrub_start(int argc, char **argv, int resume)
 
 	path = argv[optind];
 
-	fdmnt = open_file_or_dir(path);
+	fdmnt = open_path_or_dev_mnt(path);
+
 	if (fdmnt < 0) {
 		ERR(!do_quiet, "ERROR: can't access '%s'\n", path);
 		return 12;
 	}
 
-	ret = get_fs_info(fdmnt, path, &fi_args, &di_args);
+	ret = get_fs_info(path, &fi_args, &di_args);
 	if (ret) {
 		ERR(!do_quiet, "ERROR: getting dev info for scrub failed: "
 		    "%s\n", strerror(-ret));
@@ -1369,11 +1388,14 @@ static int scrub_start(int argc, char **argv, int resume)
 	ret = pthread_cancel(t_prog);
 	if (!ret)
 		ret = pthread_join(t_prog, &terr);
+
+	/* check for errors from the handling of the progress thread */
 	if (do_print && ret) {
-		fprintf(stderr, "ERROR: progress thead handling failed: %s\n",
+		fprintf(stderr, "ERROR: progress thread handling failed: %s\n",
 			strerror(ret));
 	}
 
+	/* check for errors returned from the progress thread itself */
 	if (do_print && terr && terr != PTHREAD_CANCELED) {
 		fprintf(stderr, "ERROR: recording progress "
 			"failed: %s\n", strerror(-PTR_ERR(terr)));
@@ -1438,52 +1460,37 @@ static int cmd_scrub_cancel(int argc, char **argv)
 {
 	char *path;
 	int ret;
-	int fdmnt;
-	int err;
-	char mp[BTRFS_PATH_NAME_MAX + 1];
-	struct btrfs_fs_devices *fs_devices_mnt = NULL;
+	int fdmnt = -1;
 
 	if (check_argc_exact(argc, 2))
 		usage(cmd_scrub_cancel_usage);
 
 	path = argv[1];
 
-	fdmnt = open_file_or_dir(path);
+	fdmnt = open_path_or_dev_mnt(path);
 	if (fdmnt < 0) {
-		fprintf(stderr, "ERROR: scrub cancel failed\n");
-		return 12;
+		fprintf(stderr, "ERROR: could not open %s: %s\n",
+			path, strerror(errno));
+		ret = 1;
+		goto out;
 	}
 
-again:
 	ret = ioctl(fdmnt, BTRFS_IOC_SCRUB_CANCEL, NULL);
-	err = errno;
 
-	if (ret && err == EINVAL) {
-		/* path is not a btrfs mount point.  See if it's a device. */
-		ret = check_mounted_where(fdmnt, path, mp, sizeof(mp),
-					  &fs_devices_mnt);
-		if (ret) {
-			/* It is a device; open the mountpoint. */
-			close(fdmnt);
-			fdmnt = open_file_or_dir(mp);
-			if (fdmnt >= 0) {
-				path = mp;
-				goto again;
-			}
-		}
-	}
-
-	close(fdmnt);
-
-	if (ret) {
+	if (ret < 0) {
 		fprintf(stderr, "ERROR: scrub cancel failed on %s: %s\n", path,
-			err == ENOTCONN ? "not running" : strerror(errno));
-		return 1;
+			errno == ENOTCONN ? "not running" : strerror(errno));
+		ret = 1;
+		goto out;
 	}
 
+	ret = 0;
 	printf("scrub cancelled\n");
 
-	return 0;
+out:
+	if (fdmnt != -1)
+		close(fdmnt);
+	return ret;
 }
 
 static const char * const cmd_scrub_resume_usage[] = {
@@ -1552,13 +1559,14 @@ static int cmd_scrub_status(int argc, char **argv)
 
 	path = argv[optind];
 
-	fdmnt = open_file_or_dir(path);
+	fdmnt = open_path_or_dev_mnt(path);
+
 	if (fdmnt < 0) {
 		fprintf(stderr, "ERROR: can't access to '%s'\n", path);
 		return 12;
 	}
 
-	ret = get_fs_info(fdmnt, path, &fi_args, &di_args);
+	ret = get_fs_info(path, &fi_args, &di_args);
 	if (ret) {
 		fprintf(stderr, "ERROR: getting dev info for scrub failed: "
 				"%s\n", strerror(-ret));

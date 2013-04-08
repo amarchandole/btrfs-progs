@@ -973,7 +973,7 @@ static u64 count_csum_range(struct btrfs_root *root, u64 start, u64 len)
 	size_t size;
 	u64 found = 0;
 	u64 csum_end;
-	u16 csum_size = btrfs_super_csum_size(&root->fs_info->super_copy);
+	u16 csum_size = btrfs_super_csum_size(root->fs_info->super_copy);
 
 	btrfs_init_path(&path);
 
@@ -3610,11 +3610,11 @@ int cmd_check(int argc, char **argv)
 	}
 
 	info = open_ctree_fs_info(argv[optind], bytenr, rw, 1);
-	uuid_unparse(info->super_copy.fsid, uuidbuf);
-	printf("Checking filesystem on %s\nUUID: %s\n", argv[optind], uuidbuf);
-
 	if (info == NULL)
 		return 1;
+
+	uuid_unparse(info->super_copy->fsid, uuidbuf);
+	printf("Checking filesystem on %s\nUUID: %s\n", argv[optind], uuidbuf);
 
 	if (!extent_buffer_uptodate(info->tree_root->node) ||
 	    !extent_buffer_uptodate(info->dev_root->node) ||

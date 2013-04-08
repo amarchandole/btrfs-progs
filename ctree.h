@@ -19,12 +19,21 @@
 #ifndef __BTRFS__
 #define __BTRFS__
 
+#if BTRFS_FLAT_INCLUDES
 #include "list.h"
 #include "kerncompat.h"
 #include "radix-tree.h"
 #include "extent-cache.h"
 #include "extent_io.h"
 #include "ioctl.h"
+#else
+#include <btrfs/list.h>
+#include <btrfs/kerncompat.h>
+#include <btrfs/radix-tree.h>
+#include <btrfs/extent-cache.h>
+#include <btrfs/extent_io.h>
+#include <btrfs/ioctl.h>
+#endif /* BTRFS_FLAT_INCLUDES */
 
 struct btrfs_root;
 struct btrfs_trans_handle;
@@ -914,7 +923,7 @@ struct btrfs_fs_info {
 	u64 alloc_start;
 
 	struct btrfs_trans_handle *running_transaction;
-	struct btrfs_super_block super_copy;
+	struct btrfs_super_block *super_copy;
 	struct mutex fs_mutex;
 
 	u64 super_bytenr;

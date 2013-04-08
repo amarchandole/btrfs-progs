@@ -27,6 +27,8 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/stat.h>
+#include <lzo/lzoconf.h>
+#include <lzo/lzo1x.h>
 #include <zlib.h>
 
 #include "ctree.h"
@@ -39,14 +41,19 @@
 #include "utils.h"
 #include "commands.h"
 
+static char fs_name[4096];
 static char path_name[4096];
 static int get_snaps = 0;
 static int verbose = 0;
 static int ignore_errors = 0;
 static int overwrite = 0;
 
-static int decompress(char *inbuf, char *outbuf, u64 compress_len,
-		      u64 decompress_len)
+#define LZO_LEN 4
+#define PAGE_CACHE_SIZE 4096
+#define lzo1x_worst_compress(x) ((x) + ((x) / 16) + 64 + 3)
+
+static int decompress_zlib(char *inbuf, char *outbuf, u64 compress_len,
+			   u64 decompress_len)
 {
 	z_stream strm;
 	int ret;
@@ -65,12 +72,79 @@ static int decompress(char *inbuf, char *outbuf, u64 compress_len,
 	ret = inflate(&strm, Z_NO_FLUSH);
 	if (ret != Z_STREAM_END) {
 		(void)inflateEnd(&strm);
-		fprintf(stderr, "ret is %d\n", ret);
+		fprintf(stderr, "failed to inflate: %d\n", ret);
 		return -1;
 	}
 
 	(void)inflateEnd(&strm);
 	return 0;
+}
+static inline size_t read_compress_length(unsigned char *buf)
+{
+	__le32 dlen;
+	memcpy(&dlen, buf, LZO_LEN);
+	return le32_to_cpu(dlen);
+}
+
+static int decompress_lzo(unsigned char *inbuf, char *outbuf, u64 compress_len,
+			  u64 *decompress_len)
+{
+	size_t new_len;
+	size_t in_len;
+	size_t out_len = 0;
+	size_t tot_len;
+	size_t tot_in;
+	int ret;
+
+	ret = lzo_init();
+	if (ret != LZO_E_OK) {
+		fprintf(stderr, "lzo init returned %d\n", ret);
+		return -1;
+	}
+
+	tot_len = read_compress_length(inbuf);
+	inbuf += LZO_LEN;
+	tot_in = LZO_LEN;
+
+	while (tot_in < tot_len) {
+		in_len = read_compress_length(inbuf);
+		inbuf += LZO_LEN;
+		tot_in += LZO_LEN;
+
+		new_len = lzo1x_worst_compress(PAGE_CACHE_SIZE);
+		ret = lzo1x_decompress_safe((const unsigned char *)inbuf, in_len,
+					    (unsigned char *)outbuf, &new_len, NULL);
+		if (ret != LZO_E_OK) {
+			fprintf(stderr, "failed to inflate: %d\n", ret);
+			return -1;
+		}
+		out_len += new_len;
+		outbuf += new_len;
+		inbuf += in_len;
+		tot_in += in_len;
+	}
+
+	*decompress_len = out_len;
+
+	return 0;
+}
+
+static int decompress(char *inbuf, char *outbuf, u64 compress_len,
+		      u64 *decompress_len, int compress)
+{
+	switch (compress) {
+	case BTRFS_COMPRESS_ZLIB:
+		return decompress_zlib(inbuf, outbuf, compress_len,
+				       *decompress_len);
+	case BTRFS_COMPRESS_LZO:
+		return decompress_lzo((unsigned char *)inbuf, outbuf, compress_len,
+				      decompress_len);
+	default:
+		break;
+	}
+
+	fprintf(stderr, "invalid compression type: %d\n", compress);
+	return -1;
 }
 
 int next_leaf(struct btrfs_root *root, struct btrfs_path *path)
@@ -131,11 +205,11 @@ static int copy_one_inline(int fd, struct btrfs_path *path, u64 pos)
 	struct btrfs_file_extent_item *fi;
 	char buf[4096];
 	char *outbuf;
+	u64 ram_size;
 	ssize_t done;
 	unsigned long ptr;
 	int ret;
 	int len;
-	int ram_size;
 	int compress;
 
 	fi = btrfs_item_ptr(leaf, path->slots[0],
@@ -163,7 +237,7 @@ static int copy_one_inline(int fd, struct btrfs_path *path, u64 pos)
 		return -1;
 	}
 
-	ret = decompress(buf, outbuf, len, ram_size);
+	ret = decompress(buf, outbuf, len, &ram_size, compress);
 	if (ret) {
 		free(outbuf);
 		return ret;
@@ -172,7 +246,7 @@ static int copy_one_inline(int fd, struct btrfs_path *path, u64 pos)
 	done = pwrite(fd, outbuf, ram_size, pos);
 	free(outbuf);
 	if (done < ram_size) {
-		fprintf(stderr, "Short compressed inline write, wanted %d, "
+		fprintf(stderr, "Short compressed inline write, wanted %Lu, "
 			"did %zd: %d\n", ram_size, done, errno);
 		return -1;
 	}
@@ -194,17 +268,23 @@ static int copy_one_extent(struct btrfs_root *root, int fd,
 	u64 length;
 	u64 size_left;
 	u64 dev_bytenr;
+	u64 offset;
 	u64 count = 0;
 	int compress;
 	int ret;
 	int dev_fd;
+	int mirror_num = 1;
+	int num_copies;
 
 	compress = btrfs_file_extent_compression(leaf, fi);
 	bytenr = btrfs_file_extent_disk_bytenr(leaf, fi);
 	disk_size = btrfs_file_extent_disk_num_bytes(leaf, fi);
 	ram_size = btrfs_file_extent_ram_bytes(leaf, fi);
+	offset = btrfs_file_extent_offset(leaf, fi);
 	size_left = disk_size;
 
+	if (offset)
+		printf("offset is %Lu\n", offset);
 	/* we found a hole */
 	if (disk_size == 0)
 		return 0;
@@ -226,12 +306,10 @@ static int copy_one_extent(struct btrfs_root *root, int fd,
 again:
 	length = size_left;
 	ret = btrfs_map_block(&root->fs_info->mapping_tree, READ,
-			      bytenr, &length, &multi, 0, NULL);
+			      bytenr, &length, &multi, mirror_num, NULL);
 	if (ret) {
-		free(inbuf);
-		free(outbuf);
 		fprintf(stderr, "Error mapping block %d\n", ret);
-		return ret;
+		goto out;
 	}
 	device = multi->stripes[0].dev;
 	dev_fd = device->fd;
@@ -241,56 +319,70 @@ again:
 
 	if (size_left < length)
 		length = size_left;
-	size_left -= length;
 
 	done = pread(dev_fd, inbuf+count, length, dev_bytenr);
-	if (done < length) {
-		free(inbuf);
-		free(outbuf);
-		fprintf(stderr, "Short read %d\n", errno);
-		return -1;
+	/* Need both checks, or we miss negative values due to u64 conversion */
+	if (done < 0 || done < length) {
+		num_copies = btrfs_num_copies(&root->fs_info->mapping_tree,
+					      bytenr, length);
+		mirror_num++;
+		/* mirror_num is 1-indexed, so num_copies is a valid mirror. */
+		if (mirror_num > num_copies) {
+			ret = -1;
+			fprintf(stderr, "Exhausted mirrors trying to read\n");
+			goto out;
+		}
+		fprintf(stderr, "Trying another mirror\n");
+		goto again;
 	}
 
+	mirror_num = 1;
+	size_left -= length;
 	count += length;
 	bytenr += length;
 	if (size_left)
 		goto again;
-
 
 	if (compress == BTRFS_COMPRESS_NONE) {
 		while (total < ram_size) {
 			done = pwrite(fd, inbuf+total, ram_size-total,
 				      pos+total);
 			if (done < 0) {
-				free(inbuf);
+				ret = -1;
 				fprintf(stderr, "Error writing: %d %s\n", errno, strerror(errno));
-				return -1;
+				goto out;
 			}
 			total += done;
 		}
-		free(inbuf);
-		return 0;
+		ret = 0;
+		goto out;
 	}
 
-	ret = decompress(inbuf, outbuf, disk_size, ram_size);
-	free(inbuf);
+	ret = decompress(inbuf, outbuf, disk_size, &ram_size, compress);
 	if (ret) {
-		free(outbuf);
-		return ret;
+		num_copies = btrfs_num_copies(&root->fs_info->mapping_tree,
+					      bytenr, length);
+		mirror_num++;
+		if (mirror_num >= num_copies) {
+			ret = -1;
+			goto out;
+		}
+		fprintf(stderr, "Trying another mirror\n");
+		goto again;
 	}
 
 	while (total < ram_size) {
 		done = pwrite(fd, outbuf+total, ram_size-total, pos+total);
 		if (done < 0) {
-			free(outbuf);
-			fprintf(stderr, "Error writing: %d %s\n", errno, strerror(errno));
-			return -1;
+			ret = -1;
+			goto out;
 		}
 		total += done;
 	}
+out:
+	free(inbuf);
 	free(outbuf);
-
-	return 0;
+	return ret;
 }
 
 static int ask_to_continue(const char *file)
@@ -440,7 +532,7 @@ set_size:
 }
 
 static int search_dir(struct btrfs_root *root, struct btrfs_key *key,
-		      const char *dir)
+		      const char *output_rootdir, const char *dir)
 {
 	struct btrfs_path *path;
 	struct extent_buffer *leaf;
@@ -544,8 +636,11 @@ static int search_dir(struct btrfs_root *root, struct btrfs_key *key,
 		type = btrfs_dir_type(leaf, dir_item);
 		btrfs_dir_item_key_to_cpu(leaf, dir_item, &location);
 
-		snprintf(path_name, 4096, "%s/%s", dir, filename);
+		/* full path from root of btrfs being restored */
+		snprintf(fs_name, 4096, "%s/%s", dir, filename);
 
+		/* full path from system root */
+		snprintf(path_name, 4096, "%s%s", output_rootdir, fs_name);
 
 		/*
 		 * At this point we're only going to restore directories and
@@ -593,7 +688,7 @@ static int search_dir(struct btrfs_root *root, struct btrfs_key *key,
 			}
 		} else if (type == BTRFS_FT_DIR) {
 			struct btrfs_root *search_root = root;
-			char *dir = strdup(path_name);
+			char *dir = strdup(fs_name);
 
 			if (!dir) {
 				fprintf(stderr, "Ran out of memory\n");
@@ -655,7 +750,8 @@ static int search_dir(struct btrfs_root *root, struct btrfs_key *key,
 				return -1;
 			}
 			loops = 0;
-			ret = search_dir(search_root, &location, dir);
+			ret = search_dir(search_root, &location,
+					 output_rootdir, dir);
 			free(dir);
 			if (ret) {
 				if (ignore_errors)
@@ -674,9 +770,70 @@ next:
 	return 0;
 }
 
-static struct btrfs_root *open_fs(const char *dev, u64 root_location, int super_mirror)
+static int do_list_roots(struct btrfs_root *root)
 {
-	struct btrfs_root *root;
+	struct btrfs_key key;
+	struct btrfs_key found_key;
+	struct btrfs_disk_key disk_key;
+	struct btrfs_path *path;
+	struct extent_buffer *leaf;
+	struct btrfs_root_item ri;
+	unsigned long offset;
+	int slot;
+	int ret;
+
+	root = root->fs_info->tree_root;
+	path = btrfs_alloc_path();
+	if (!path) {
+		fprintf(stderr, "Failed to alloc path\n");
+		return -1;
+	}
+
+	key.offset = 0;
+	key.objectid = 0;
+	key.type = BTRFS_ROOT_ITEM_KEY;
+
+	ret = btrfs_search_slot(NULL, root, &key, path, 0, 0);
+	if (ret < 0) {
+		fprintf(stderr, "Failed to do search %d\n", ret);
+		btrfs_free_path(path);
+		return -1;
+	}
+
+	while (1) {
+		leaf = path->nodes[0];
+		slot = path->slots[0];
+		if (slot >= btrfs_header_nritems(leaf)) {
+			ret = btrfs_next_leaf(root, path);
+			if (ret)
+				break;
+			leaf = path->nodes[0];
+			slot = path->slots[0];
+		}
+		btrfs_item_key(leaf, &disk_key, slot);
+		btrfs_disk_key_to_cpu(&found_key, &disk_key);
+		if (btrfs_key_type(&found_key) != BTRFS_ROOT_ITEM_KEY) {
+			path->slots[0]++;
+			continue;
+		}
+
+		offset = btrfs_item_ptr_offset(leaf, slot);
+		read_extent_buffer(leaf, &ri, offset, sizeof(ri));
+		printf(" tree ");
+		btrfs_print_key(&disk_key);
+		printf(" %Lu level %d\n", btrfs_root_bytenr(&ri),
+		       btrfs_root_level(&ri));
+		path->slots[0]++;
+	}
+	btrfs_free_path(path);
+
+	return 0;
+}
+
+static struct btrfs_root *open_fs(const char *dev, u64 root_location,
+				  int super_mirror, int list_roots)
+{
+	struct btrfs_root *root = NULL;
 	u64 bytenr;
 	int i;
 
@@ -684,11 +841,19 @@ static struct btrfs_root *open_fs(const char *dev, u64 root_location, int super_
 		bytenr = btrfs_sb_offset(i);
 		root = open_ctree_recovery(dev, bytenr, root_location);
 		if (root)
-			return root;
+			break;
 		fprintf(stderr, "Could not open root, trying backup super\n");
 	}
 
-	return NULL;
+	if (root && list_roots) {
+		int ret = do_list_roots(root);
+		if (ret) {
+			close_ctree(root);
+			root = NULL;
+		}
+	}
+
+	return root;
 }
 
 static int find_first_dir(struct btrfs_root *root, u64 *objectid)
@@ -763,10 +928,6 @@ const char * const cmd_restore_usage[] = {
 	"-f <offset>     filesystem location",
 	"-u <block>      super mirror",
 	"-d              find dir",
-	"-r <num>        root objectid",
-	"-c              ignore case in regular expression",
-	"-m <regexp>     regular expression to match",
-	"-l              list roots",
 	NULL
 };
 
@@ -777,13 +938,15 @@ int cmd_restore(int argc, char **argv)
 	char dir_name[128];
 	u64 tree_location = 0;
 	u64 fs_location = 0;
+	u64 root_objectid = 0;
 	int len;
 	int ret;
 	int opt;
 	int super_mirror = 0;
 	int find_dir = 0;
+	int list_roots = 0;
 
-	while ((opt = getopt(argc, argv, "sviot:u:df:")) != -1) {
+	while ((opt = getopt(argc, argv, "sviot:u:df:r:l")) != -1) {
 		switch (opt) {
 			case 's':
 				get_snaps = 1;
@@ -826,26 +989,42 @@ int cmd_restore(int argc, char **argv)
 			case 'd':
 				find_dir = 1;
 				break;
+			case 'r':
+				errno = 0;
+				root_objectid = (u64)strtoll(optarg, NULL, 10);
+				if (errno != 0) {
+					fprintf(stderr, "Root objectid not valid\n");
+					exit(1);
+				}
+				break;
+			case 'l':
+				list_roots = 1;
+				break;
 			default:
 				usage(cmd_restore_usage);
 		}
 	}
 
-	if (optind + 1 >= argc)
+	if (!list_roots && optind + 1 >= argc)
+		usage(cmd_restore_usage);
+	else if (list_roots && optind >= argc)
 		usage(cmd_restore_usage);
 
 	if ((ret = check_mounted(argv[optind])) < 0) {
 		fprintf(stderr, "Could not check mount status: %s\n",
-			strerror(ret));
+			strerror(-ret));
 		return ret;
 	} else if (ret) {
 		fprintf(stderr, "%s is currently mounted.  Aborting.\n", argv[optind]);
 		return 1;
 	}
 
-	root = open_fs(argv[optind], tree_location, super_mirror);
+	root = open_fs(argv[optind], tree_location, super_mirror, list_roots);
 	if (root == NULL)
 		return 1;
+
+	if (list_roots)
+		goto out;
 
 	if (fs_location != 0) {
 		free_extent_buffer(root->node);
@@ -855,8 +1034,6 @@ int cmd_restore(int argc, char **argv)
 			goto out;
 		}
 	}
-
-	printf("Root objectid is %Lu\n", root->objectid);
 
 	memset(path_name, 0, 4096);
 
@@ -869,6 +1046,23 @@ int cmd_restore(int argc, char **argv)
 		dir_name[len] = '\0';
 	}
 
+	if (root_objectid != 0) {
+		struct btrfs_root *orig_root = root;
+
+		key.objectid = root_objectid;
+		key.type = BTRFS_ROOT_ITEM_KEY;
+		key.offset = (u64)-1;
+		root = btrfs_read_fs_root(orig_root->fs_info, &key);
+		if (IS_ERR(root)) {
+			fprintf(stderr, "Error reading root\n");
+			root = orig_root;
+			ret = 1;
+			goto out;
+		}
+		key.type = 0;
+		key.offset = 0;
+	}
+
 	if (find_dir) {
 		ret = find_first_dir(root, &key.objectid);
 		if (ret)
@@ -877,7 +1071,7 @@ int cmd_restore(int argc, char **argv)
 		key.objectid = BTRFS_FIRST_FREE_OBJECTID;
 	}
 
-	ret = search_dir(root->fs_info->fs_root, &key, dir_name);
+	ret = search_dir(root, &key, dir_name, "");
 
 out:
 	close_ctree(root);

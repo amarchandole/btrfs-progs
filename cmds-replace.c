@@ -77,10 +77,13 @@ static int is_numerical(const char *str)
 static int dev_replace_cancel_fd = -1;
 static void dev_replace_sigint_handler(int signal)
 {
+	int ret;
 	struct btrfs_ioctl_dev_replace_args args = {0};
 
 	args.cmd = BTRFS_IOCTL_DEV_REPLACE_CMD_CANCEL;
-	ioctl(dev_replace_cancel_fd, BTRFS_IOC_DEV_REPLACE, &args);
+	ret = ioctl(dev_replace_cancel_fd, BTRFS_IOC_DEV_REPLACE, &args);
+	if (ret < 0)
+		perror("Device replace cancel failed");
 }
 
 static int dev_replace_handle_sigint(int fd)
@@ -165,7 +168,9 @@ static int cmd_start_replace(int argc, char **argv)
 	if (check_argc_exact(argc - optind, 3))
 		usage(cmd_start_replace_usage);
 	path = argv[optind + 2];
-	fdmnt = open_file_or_dir(path);
+
+	fdmnt = open_path_or_dev_mnt(path);
+
 	if (fdmnt < 0) {
 		fprintf(stderr, "ERROR: can't access \"%s\": %s\n",
 			path, strerror(errno));
@@ -212,7 +217,7 @@ static int cmd_start_replace(int argc, char **argv)
 		}
 		start_args.start.srcdevid = (__u64)atoi(srcdev);
 
-		ret = get_fs_info(fdmnt, path, &fi_args, &di_args);
+		ret = get_fs_info(path, &fi_args, &di_args);
 		if (ret) {
 			fprintf(stderr, "ERROR: getting dev info for devstats failed: "
 					"%s\n", strerror(-ret));
@@ -228,6 +233,7 @@ static int cmd_start_replace(int argc, char **argv)
 		for (i = 0; i < fi_args.num_devices; i++)
 			if (start_args.start.srcdevid == di_args[i].devid)
 				break;
+		free(di_args);
 		if (i == fi_args.num_devices) {
 			fprintf(stderr, "Error: '%s' is not a valid devid for filesystem '%s'\n",
 				srcdev, path);
@@ -235,7 +241,7 @@ static int cmd_start_replace(int argc, char **argv)
 		}
 	} else {
 		fdsrcdev = open(srcdev, O_RDWR);
-		if (!fdsrcdev) {
+		if (fdsrcdev < 0) {
 			fprintf(stderr, "Error: Unable to open device '%s'\n",
 				srcdev);
 			goto leave_with_error;
