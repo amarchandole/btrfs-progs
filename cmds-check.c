@@ -38,11 +38,13 @@
 #include "version.h"
 #include "utils.h"
 #include "commands.h"
+#include "free-space-cache.h"
 
 static u64 bytes_used = 0;
 static u64 total_csum_bytes = 0;
 static u64 total_btree_bytes = 0;
 static u64 total_fs_tree_bytes = 0;
+static u64 total_extent_tree_bytes = 0;
 static u64 btree_space_waste = 0;
 static u64 data_bytes_allocated = 0;
 static u64 data_bytes_referenced = 0;
@@ -64,6 +66,7 @@ struct data_backref {
 	};
 	u64 owner;
 	u64 offset;
+	u64 bytes;
 	u32 num_refs;
 	u32 found_ref;
 };
@@ -91,6 +94,7 @@ struct extent_record {
 	unsigned int content_checked:1;
 	unsigned int owner_ref_checked:1;
 	unsigned int is_root:1;
+	unsigned int metadata:1;
 };
 
 struct inode_backref {
@@ -1208,7 +1212,7 @@ static int walk_down_tree(struct btrfs_root *root, struct btrfs_path *path,
 	WARN_ON(*level >= BTRFS_MAX_LEVEL);
 	ret = btrfs_lookup_extent_info(NULL, root,
 				       path->nodes[*level]->start,
-				       path->nodes[*level]->len, &refs, NULL);
+				       *level, 1, &refs, NULL);
 	if (ret < 0)
 		goto out;
 
@@ -1236,8 +1240,8 @@ static int walk_down_tree(struct btrfs_root *root, struct btrfs_path *path,
 		bytenr = btrfs_node_blockptr(cur, path->slots[*level]);
 		ptr_gen = btrfs_node_ptr_generation(cur, path->slots[*level]);
 		blocksize = btrfs_level_size(root, *level - 1);
-		ret = btrfs_lookup_extent_info(NULL, root, bytenr, blocksize,
-					       &refs, NULL);
+		ret = btrfs_lookup_extent_info(NULL, root, bytenr, *level - 1,
+					       1, &refs, NULL);
 		if (ret < 0)
 			refs = 0;
 
@@ -1919,6 +1923,17 @@ static int all_backpointers_checked(struct extent_record *rec, int print_errs)
 					(unsigned long long)dback->offset,
 					dback->found_ref, dback->num_refs, back);
 			}
+			if (dback->bytes != rec->nr) {
+				err = 1;
+				if (!print_errs)
+					goto out;
+				fprintf(stderr, "Backref bytes do not match "
+					"extent backref, bytenr=%llu, ref "
+					"bytes=%llu, backref bytes=%llu\n",
+					(unsigned long long)rec->start,
+					(unsigned long long)rec->nr,
+					(unsigned long long)dback->bytes);
+			}
 		}
 		if (!back->is_data) {
 			found += 1;
@@ -2164,7 +2179,8 @@ static struct tree_backref *alloc_tree_backref(struct extent_record *rec,
 
 static struct data_backref *find_data_backref(struct extent_record *rec,
 						u64 parent, u64 root,
-						u64 owner, u64 offset)
+						u64 owner, u64 offset,
+						int found_ref, u64 bytes)
 {
 	struct list_head *cur = rec->backrefs.next;
 	struct extent_backref *node;
@@ -2185,8 +2201,12 @@ static struct data_backref *find_data_backref(struct extent_record *rec,
 			if (node->full_backref)
 				continue;
 			if (back->root == root && back->owner == owner &&
-			    back->offset == offset)
+			    back->offset == offset) {
+				if (found_ref && node->found_ref &&
+				    back->bytes != bytes)
+					continue;
 				return back;
+			}
 		}
 	}
 	return NULL;
@@ -2212,6 +2232,7 @@ static struct data_backref *alloc_data_backref(struct extent_record *rec,
 		ref->offset = offset;
 		ref->node.full_backref = 0;
 	}
+	ref->bytes = max_size;
 	ref->found_ref = 0;
 	ref->num_refs = 0;
 	list_add_tail(&ref->node.list, &rec->backrefs);
@@ -2224,7 +2245,7 @@ static int add_extent_rec(struct cache_tree *extent_cache,
 			  struct btrfs_key *parent_key,
 			  u64 start, u64 nr, u64 extent_item_refs,
 			  int is_root, int inc_ref, int set_checked,
-			  u64 max_size)
+			  int metadata, int extent_rec, u64 max_size)
 {
 	struct extent_record *rec;
 	struct cache_extent *cache;
@@ -2237,6 +2258,14 @@ static int add_extent_rec(struct cache_tree *extent_cache,
 			rec->refs++;
 		if (rec->nr == 1)
 			rec->nr = max(nr, max_size);
+
+		/*
+		 * We need to make sure to reset nr to whatever the extent
+		 * record says was the real size, this way we can compare it to
+		 * the backrefs.
+		 */
+		if (extent_rec)
+			rec->nr = nr;
 
 		if (start != rec->start) {
 			fprintf(stderr, "warning, start mismatch %llu %llu\n",
@@ -2277,6 +2306,7 @@ static int add_extent_rec(struct cache_tree *extent_cache,
 	rec->nr = max(nr, max_size);
 	rec->content_checked = 0;
 	rec->owner_ref_checked = 0;
+	rec->metadata = metadata;
 	INIT_LIST_HEAD(&rec->backrefs);
 
 	if (is_root)
@@ -2320,7 +2350,8 @@ static int add_tree_backref(struct cache_tree *extent_cache, u64 bytenr,
 
 	cache = find_cache_extent(extent_cache, bytenr, 1);
 	if (!cache) {
-		add_extent_rec(extent_cache, NULL, bytenr, 1, 0, 0, 0, 0, 0);
+		add_extent_rec(extent_cache, NULL, bytenr,
+			       1, 0, 0, 0, 0, 1, 0, 0);
 		cache = find_cache_extent(extent_cache, bytenr, 1);
 		if (!cache)
 			abort();
@@ -2368,7 +2399,7 @@ static int add_data_backref(struct cache_tree *extent_cache, u64 bytenr,
 	cache = find_cache_extent(extent_cache, bytenr, 1);
 	if (!cache) {
 		add_extent_rec(extent_cache, NULL, bytenr, 1, 0, 0, 0, 0,
-			       max_size);
+			       0, 0, max_size);
 		cache = find_cache_extent(extent_cache, bytenr, 1);
 		if (!cache)
 			abort();
@@ -2381,15 +2412,29 @@ static int add_data_backref(struct cache_tree *extent_cache, u64 bytenr,
 	if (rec->max_size < max_size)
 		rec->max_size = max_size;
 
-	back = find_data_backref(rec, parent, root, owner, offset);
+	/*
+	 * If found_ref is set then max_size is the real size and must match the
+	 * existing refs.  So if we have already found a ref then we need to
+	 * make sure that this ref matches the existing one, otherwise we need
+	 * to add a new backref so we can notice that the backrefs don't match
+	 * and we need to figure out who is telling the truth.  This is to
+	 * account for that awful fsync bug I introduced where we'd end up with
+	 * a btrfs_file_extent_item that would have its length include multiple
+	 * prealloc extents or point inside of a prealloc extent.
+	 */
+	back = find_data_backref(rec, parent, root, owner, offset, found_ref,
+				 max_size);
 	if (!back)
 		back = alloc_data_backref(rec, parent, root, owner, offset,
 					  max_size);
 
 	if (found_ref) {
 		BUG_ON(num_refs != 1);
+		if (back->node.found_ref)
+			BUG_ON(back->bytes != max_size);
 		back->node.found_ref = 1;
 		back->found_ref += 1;
+		back->bytes = max_size;
 	} else {
 		if (back->node.found_extent_tree) {
 			fprintf(stderr, "Extent back ref already exists "
@@ -2506,7 +2551,8 @@ static int process_extent_ref_v0(struct cache_tree *extent_cache,
 }
 #endif
 
-static int process_extent_item(struct cache_tree *extent_cache,
+static int process_extent_item(struct btrfs_root *root,
+			       struct cache_tree *extent_cache,
 			       struct extent_buffer *eb, int slot)
 {
 	struct btrfs_extent_item *ei;
@@ -2520,8 +2566,17 @@ static int process_extent_item(struct cache_tree *extent_cache,
 	u32 item_size = btrfs_item_size_nr(eb, slot);
 	u64 refs = 0;
 	u64 offset;
+	u64 num_bytes;
+	int metadata = 0;
 
 	btrfs_item_key_to_cpu(eb, &key, slot);
+
+	if (key.type == BTRFS_METADATA_ITEM_KEY) {
+		metadata = 1;
+		num_bytes = root->leafsize;
+	} else {
+		num_bytes = key.offset;
+	}
 
 	if (item_size < sizeof(*ei)) {
 #ifdef BTRFS_COMPAT_EXTENT_TREE_V0
@@ -2533,17 +2588,19 @@ static int process_extent_item(struct cache_tree *extent_cache,
 		BUG();
 #endif
 		return add_extent_rec(extent_cache, NULL, key.objectid,
-				      key.offset, refs, 0, 0, 0, key.offset);
+				      num_bytes, refs, 0, 0, 0, metadata, 1,
+				      num_bytes);
 	}
 
 	ei = btrfs_item_ptr(eb, slot, struct btrfs_extent_item);
 	refs = btrfs_extent_refs(eb, ei);
 
-	add_extent_rec(extent_cache, NULL, key.objectid, key.offset,
-		       refs, 0, 0, 0, key.offset);
+	add_extent_rec(extent_cache, NULL, key.objectid, num_bytes,
+		       refs, 0, 0, 0, metadata, 1, num_bytes);
 
 	ptr = (unsigned long)(ei + 1);
-	if (btrfs_extent_flags(eb, ei) & BTRFS_EXTENT_FLAG_TREE_BLOCK)
+	if (btrfs_extent_flags(eb, ei) & BTRFS_EXTENT_FLAG_TREE_BLOCK &&
+	    key.type == BTRFS_EXTENT_ITEM_KEY)
 		ptr += sizeof(struct btrfs_tree_block_info);
 
 	end = (unsigned long)ei + item_size;
@@ -2568,18 +2625,18 @@ static int process_extent_item(struct cache_tree *extent_cache,
 								       dref),
 					btrfs_extent_data_ref_offset(eb, dref),
 					btrfs_extent_data_ref_count(eb, dref),
-					0, key.offset);
+					0, num_bytes);
 			break;
 		case BTRFS_SHARED_DATA_REF_KEY:
 			sref = (struct btrfs_shared_data_ref *)(iref + 1);
 			add_data_backref(extent_cache, key.objectid, offset,
 					0, 0, 0,
 					btrfs_shared_data_ref_count(eb, sref),
-					0, key.offset);
+					0, num_bytes);
 			break;
 		default:
 			fprintf(stderr, "corrupt extent record: key %Lu %u %Lu\n",
-				key.objectid, key.type, key.offset);
+				key.objectid, key.type, num_bytes);
 			goto out;
 		}
 		ptr += btrfs_extent_inline_ref_size(type);
@@ -2587,6 +2644,431 @@ static int process_extent_item(struct cache_tree *extent_cache,
 	WARN_ON(ptr > end);
 out:
 	return 0;
+}
+
+static int check_cache_range(struct btrfs_root *root,
+			     struct btrfs_block_group_cache *cache,
+			     u64 offset, u64 bytes)
+{
+	struct btrfs_free_space *entry;
+	u64 *logical;
+	u64 bytenr;
+	int stripe_len;
+	int i, nr, ret;
+
+	for (i = 0; i < BTRFS_SUPER_MIRROR_MAX; i++) {
+		bytenr = btrfs_sb_offset(i);
+		ret = btrfs_rmap_block(&root->fs_info->mapping_tree,
+				       cache->key.objectid, bytenr, 0,
+				       &logical, &nr, &stripe_len);
+		if (ret)
+			return ret;
+
+		while (nr--) {
+			if (logical[nr] + stripe_len <= offset)
+				continue;
+			if (offset + bytes <= logical[nr])
+				continue;
+			if (logical[nr] == offset) {
+				if (stripe_len >= bytes) {
+					kfree(logical);
+					return 0;
+				}
+				bytes -= stripe_len;
+				offset += stripe_len;
+			} else if (logical[nr] < offset) {
+				if (logical[nr] + stripe_len >=
+				    offset + bytes) {
+					kfree(logical);
+					return 0;
+				}
+				bytes = (offset + bytes) -
+					(logical[nr] + stripe_len);
+				offset = logical[nr] + stripe_len;
+			} else {
+				/*
+				 * Could be tricky, the super may land in the
+				 * middle of the area we're checking.  First
+				 * check the easiest case, it's at the end.
+				 */
+				if (logical[nr] + stripe_len >=
+				    bytes + offset) {
+					bytes = logical[nr] - offset;
+					continue;
+				}
+
+				/* Check the left side */
+				ret = check_cache_range(root, cache,
+							offset,
+							logical[nr] - offset);
+				if (ret) {
+					kfree(logical);
+					return ret;
+				}
+
+				/* Now we continue with the right side */
+				bytes = (offset + bytes) -
+					(logical[nr] + stripe_len);
+				offset = logical[nr] + stripe_len;
+			}
+		}
+
+		kfree(logical);
+	}
+
+	entry = btrfs_find_free_space(cache->free_space_ctl, offset, bytes);
+	if (!entry) {
+		fprintf(stderr, "There is no free space entry for %Lu-%Lu\n",
+			offset, offset+bytes);
+		return -EINVAL;
+	}
+
+	if (entry->offset != offset) {
+		fprintf(stderr, "Wanted offset %Lu, found %Lu\n", offset,
+			entry->offset);
+		return -EINVAL;
+	}
+
+	if (entry->bytes != bytes) {
+		fprintf(stderr, "Wanted bytes %Lu, found %Lu for off %Lu\n",
+			bytes, entry->bytes, offset);
+		return -EINVAL;
+	}
+
+	unlink_free_space(cache->free_space_ctl, entry);
+	free(entry);
+	return 0;
+}
+
+static int verify_space_cache(struct btrfs_root *root,
+			      struct btrfs_block_group_cache *cache)
+{
+	struct btrfs_path *path;
+	struct extent_buffer *leaf;
+	struct btrfs_key key;
+	u64 last;
+	int ret = 0;
+
+	path = btrfs_alloc_path();
+	if (!path)
+		return -ENOMEM;
+
+	root = root->fs_info->extent_root;
+
+	last = max_t(u64, cache->key.objectid, BTRFS_SUPER_INFO_OFFSET);
+
+	key.objectid = last;
+	key.offset = 0;
+	key.type = BTRFS_EXTENT_ITEM_KEY;
+
+	ret = btrfs_search_slot(NULL, root, &key, path, 0, 0);
+	if (ret < 0)
+		return ret;
+	ret = 0;
+	while (1) {
+		if (path->slots[0] >= btrfs_header_nritems(path->nodes[0])) {
+			ret = btrfs_next_leaf(root, path);
+			if (ret < 0)
+				return ret;
+			if (ret > 0) {
+				ret = 0;
+				break;
+			}
+		}
+		leaf = path->nodes[0];
+		btrfs_item_key_to_cpu(leaf, &key, path->slots[0]);
+		if (key.objectid >= cache->key.offset + cache->key.objectid)
+			break;
+		if (key.type != BTRFS_EXTENT_ITEM_KEY &&
+		    key.type != BTRFS_METADATA_ITEM_KEY) {
+			path->slots[0]++;
+			continue;
+		}
+
+		if (last == key.objectid) {
+			last = key.objectid + key.offset;
+			path->slots[0]++;
+			continue;
+		}
+
+		ret = check_cache_range(root, cache, last,
+					key.objectid - last);
+		if (ret)
+			break;
+		if (key.type == BTRFS_EXTENT_ITEM_KEY)
+			last = key.objectid + key.offset;
+		else
+			last = key.objectid + root->leafsize;
+		path->slots[0]++;
+	}
+
+	if (last < cache->key.objectid + cache->key.offset)
+		ret = check_cache_range(root, cache, last,
+					cache->key.objectid +
+					cache->key.offset - last);
+	btrfs_free_path(path);
+
+	if (!ret &&
+	    !RB_EMPTY_ROOT(&cache->free_space_ctl->free_space_offset)) {
+		fprintf(stderr, "There are still entries left in the space "
+			"cache\n");
+		ret = -EINVAL;
+	}
+
+	return ret;
+}
+
+static int check_space_cache(struct btrfs_root *root)
+{
+	struct btrfs_block_group_cache *cache;
+	u64 start = BTRFS_SUPER_INFO_OFFSET + BTRFS_SUPER_INFO_SIZE;
+	int ret;
+	int error = 0;
+
+	if (btrfs_super_generation(root->fs_info->super_copy) !=
+	    btrfs_super_cache_generation(root->fs_info->super_copy)) {
+		printf("cache and super generation don't match, space cache "
+		       "will be invalidated\n");
+		return 0;
+	}
+
+	while (1) {
+		cache = btrfs_lookup_first_block_group(root->fs_info, start);
+		if (!cache)
+			break;
+
+		start = cache->key.objectid + cache->key.offset;
+		if (!cache->free_space_ctl) {
+			int sectorsize;
+
+			if (cache->flags & (BTRFS_BLOCK_GROUP_METADATA |
+					    BTRFS_BLOCK_GROUP_SYSTEM))
+				sectorsize = root->leafsize;
+			else
+				sectorsize = root->sectorsize;
+
+			if (btrfs_init_free_space_ctl(cache, sectorsize)) {
+				ret = -ENOMEM;
+				break;
+			}
+		} else {
+			btrfs_remove_free_space_cache(cache);
+		}
+
+		ret = load_free_space_cache(root->fs_info, cache);
+		if (!ret)
+			continue;
+
+		ret = verify_space_cache(root, cache);
+		if (ret) {
+			fprintf(stderr, "cache appears valid but isnt %Lu\n",
+				cache->key.objectid);
+			error++;
+		}
+	}
+
+	return error ? -EINVAL : 0;
+}
+
+static int check_extent_exists(struct btrfs_root *root, u64 bytenr,
+			       u64 num_bytes)
+{
+	struct btrfs_path *path;
+	struct extent_buffer *leaf;
+	struct btrfs_key key;
+	int ret;
+
+	path = btrfs_alloc_path();
+	if (!path) {
+		fprintf(stderr, "Error allocing path\n");
+		return -ENOMEM;
+	}
+
+	key.objectid = bytenr;
+	key.type = BTRFS_EXTENT_ITEM_KEY;
+	key.offset = 0;
+
+
+again:
+	ret = btrfs_search_slot(NULL, root->fs_info->extent_root, &key, path,
+				0, 0);
+	if (ret < 0) {
+		fprintf(stderr, "Error looking up extent record %d\n", ret);
+		btrfs_free_path(path);
+		return ret;
+	} else if (ret) {
+		if (path->slots[0])
+			path->slots[0]--;
+		else
+			btrfs_prev_leaf(root, path);
+	}
+
+	btrfs_item_key_to_cpu(path->nodes[0], &key, path->slots[0]);
+
+	/*
+	 * Block group items come before extent items if they have the same
+	 * bytenr, so walk back one more just in case.  Dear future traveler,
+	 * first congrats on mastering time travel.  Now if it's not too much
+	 * trouble could you go back to 2006 and tell Chris to make the
+	 * BLOCK_GROUP_ITEM_KEY lower than the EXTENT_ITEM_KEY please?
+	 */
+	if (key.type == BTRFS_BLOCK_GROUP_ITEM_KEY) {
+		if (path->slots[0])
+			path->slots[0]--;
+		else
+			btrfs_prev_leaf(root, path);
+	}
+
+	while (num_bytes) {
+		if (path->slots[0] >= btrfs_header_nritems(path->nodes[0])) {
+			ret = btrfs_next_leaf(root, path);
+			if (ret < 0) {
+				fprintf(stderr, "Error going to next leaf "
+					"%d\n", ret);
+				btrfs_free_path(path);
+				return ret;
+			} else if (ret) {
+				break;
+			}
+		}
+		leaf = path->nodes[0];
+		btrfs_item_key_to_cpu(leaf, &key, path->slots[0]);
+		if (key.type != BTRFS_EXTENT_ITEM_KEY) {
+			path->slots[0]++;
+			continue;
+		}
+		if (key.objectid + key.offset < bytenr) {
+			path->slots[0]++;
+			continue;
+		}
+		if (key.objectid > bytenr + num_bytes)
+			break;
+
+		if (key.objectid == bytenr) {
+			if (key.offset >= num_bytes) {
+				num_bytes = 0;
+				break;
+			}
+			num_bytes -= key.offset;
+			bytenr += key.offset;
+		} else if (key.objectid < bytenr) {
+			if (key.objectid + key.offset >= bytenr + num_bytes) {
+				num_bytes = 0;
+				break;
+			}
+			num_bytes = (bytenr + num_bytes) -
+				(key.objectid + key.offset);
+			bytenr = key.objectid + key.offset;
+		} else {
+			if (key.objectid + key.offset < bytenr + num_bytes) {
+				u64 new_start = key.objectid + key.offset;
+				u64 new_bytes = bytenr + num_bytes - new_start;
+
+				/*
+				 * Weird case, the extent is in the middle of
+				 * our range, we'll have to search one side
+				 * and then the other.  Not sure if this happens
+				 * in real life, but no harm in coding it up
+				 * anyway just in case.
+				 */
+				btrfs_release_path(root, path);
+				ret = check_extent_exists(root, new_start,
+							  new_bytes);
+				if (ret) {
+					fprintf(stderr, "Right section didn't "
+						"have a record\n");
+					break;
+				}
+				num_bytes = key.objectid - bytenr;
+				goto again;
+			}
+			num_bytes = key.objectid - bytenr;
+		}
+		path->slots[0]++;
+	}
+	ret = 0;
+
+	if (num_bytes) {
+		fprintf(stderr, "There are no extents for csum range "
+			"%Lu-%Lu\n", bytenr, bytenr+num_bytes);
+		ret = 1;
+	}
+
+	btrfs_free_path(path);
+	return ret;
+}
+
+static int check_csums(struct btrfs_root *root)
+{
+	struct btrfs_path *path;
+	struct extent_buffer *leaf;
+	struct btrfs_key key;
+	u64 offset = 0, num_bytes = 0;
+	u16 csum_size = btrfs_super_csum_size(root->fs_info->super_copy);
+	int errors = 0;
+	int ret;
+
+	root = root->fs_info->csum_root;
+
+	key.objectid = BTRFS_EXTENT_CSUM_OBJECTID;
+	key.type = BTRFS_EXTENT_CSUM_KEY;
+	key.offset = 0;
+
+	path = btrfs_alloc_path();
+	if (!path)
+		return -ENOMEM;
+
+	ret = btrfs_search_slot(NULL, root, &key, path, 0, 0);
+	if (ret < 0) {
+		fprintf(stderr, "Error searching csum tree %d\n", ret);
+		btrfs_free_path(path);
+		return ret;
+	}
+
+	if (ret > 0 && path->slots[0])
+		path->slots[0]--;
+	ret = 0;
+
+	while (1) {
+		if (path->slots[0] >= btrfs_header_nritems(path->nodes[0])) {
+			ret = btrfs_next_leaf(root, path);
+			if (ret < 0) {
+				fprintf(stderr, "Error going to next leaf "
+					"%d\n", ret);
+				break;
+			}
+			if (ret)
+				break;
+		}
+		leaf = path->nodes[0];
+
+		btrfs_item_key_to_cpu(leaf, &key, path->slots[0]);
+		if (key.type != BTRFS_EXTENT_CSUM_KEY) {
+			path->slots[0]++;
+			continue;
+		}
+
+		if (!num_bytes) {
+			offset = key.offset;
+		} else if (key.offset != offset + num_bytes) {
+			ret = check_extent_exists(root, offset, num_bytes);
+			if (ret) {
+				fprintf(stderr, "Csum exists for %Lu-%Lu but "
+					"there is no extent record\n",
+					offset, offset+num_bytes);
+				errors++;
+			}
+			offset = key.offset;
+			num_bytes = 0;
+		}
+
+		num_bytes += (btrfs_item_size_nr(leaf, path->slots[0]) /
+			      csum_size) * root->sectorsize;
+		path->slots[0]++;
+	}
+
+	btrfs_free_path(path);
+	return errors;
 }
 
 static int run_next_block(struct btrfs_root *root,
@@ -2657,7 +3139,9 @@ static int run_next_block(struct btrfs_root *root,
 
 	nritems = btrfs_header_nritems(buf);
 
-	ret = btrfs_lookup_extent_info(NULL, root, bytenr, size, NULL, &flags);
+	ret = btrfs_lookup_extent_info(NULL, root, bytenr,
+				       btrfs_header_level(buf), 1, NULL,
+				       &flags);
 	if (ret < 0)
 		flags = BTRFS_BLOCK_FLAG_FULL_BACKREF;
 
@@ -2679,7 +3163,13 @@ static int run_next_block(struct btrfs_root *root,
 			struct btrfs_file_extent_item *fi;
 			btrfs_item_key_to_cpu(buf, &key, i);
 			if (key.type == BTRFS_EXTENT_ITEM_KEY) {
-				process_extent_item(extent_cache, buf, i);
+				process_extent_item(root, extent_cache, buf,
+						    i);
+				continue;
+			}
+			if (key.type == BTRFS_METADATA_ITEM_KEY) {
+				process_extent_item(root, extent_cache, buf,
+						    i);
 				continue;
 			}
 			if (key.type == BTRFS_EXTENT_CSUM_KEY) {
@@ -2753,7 +3243,7 @@ static int run_next_block(struct btrfs_root *root,
 			ret = add_extent_rec(extent_cache, NULL,
 				   btrfs_file_extent_disk_bytenr(buf, fi),
 				   btrfs_file_extent_disk_num_bytes(buf, fi),
-				   0, 0, 1, 1,
+				   0, 0, 1, 1, 0, 0,
 				   btrfs_file_extent_disk_num_bytes(buf, fi));
 			add_data_backref(extent_cache,
 				btrfs_file_extent_disk_bytenr(buf, fi),
@@ -2776,7 +3266,8 @@ static int run_next_block(struct btrfs_root *root,
 			u32 size = btrfs_level_size(root, level - 1);
 			btrfs_node_key_to_cpu(buf, &key, i);
 			ret = add_extent_rec(extent_cache, &key,
-					     ptr, size, 0, 0, 1, 0, size);
+					     ptr, size, 0, 0, 1, 0, 1, 0,
+					     size);
 			BUG_ON(ret);
 
 			add_tree_backref(extent_cache, ptr, parent, owner, 1);
@@ -2793,6 +3284,8 @@ static int run_next_block(struct btrfs_root *root,
 	total_btree_bytes += buf->len;
 	if (fs_root_objectid(btrfs_header_owner(buf)))
 		total_fs_tree_bytes += buf->len;
+	if (btrfs_header_owner(buf) == BTRFS_EXTENT_TREE_OBJECTID)
+		total_extent_tree_bytes += buf->len;
 	if (!found_old_backref &&
 	    btrfs_header_owner(buf) == BTRFS_TREE_RELOC_OBJECTID &&
 	    btrfs_header_backref_rev(buf) == BTRFS_MIXED_BACKREF_REV &&
@@ -2815,7 +3308,7 @@ static int add_root_to_pending(struct extent_buffer *buf,
 	else
 		add_pending(pending, seen, buf->start, buf->len);
 	add_extent_rec(extent_cache, NULL, buf->start, buf->len,
-		       0, 1, 1, 0, buf->len);
+		       0, 1, 1, 0, 1, 0, buf->len);
 
 	if (root_key->objectid == BTRFS_TREE_RELOC_OBJECTID ||
 	    btrfs_header_backref_rev(buf) < BTRFS_MIXED_BACKREF_REV)
@@ -2851,7 +3344,7 @@ static int free_extent_hook(struct btrfs_trans_handle *trans,
 	if (is_data) {
 		struct data_backref *back;
 		back = find_data_backref(rec, parent, root_objectid, owner,
-					 offset);
+					 offset, 1, num_bytes);
 		if (!back)
 			goto out;
 		if (back->node.found_ref) {
@@ -2936,6 +3429,7 @@ static int delete_extent_records(struct btrfs_trans_handle *trans,
 			break;
 
 		if (found_key.type != BTRFS_EXTENT_ITEM_KEY &&
+		    found_key.type != BTRFS_METADATA_ITEM_KEY &&
 		    found_key.type != BTRFS_TREE_BLOCK_REF_KEY &&
 		    found_key.type != BTRFS_EXTENT_DATA_REF_KEY &&
 		    found_key.type != BTRFS_EXTENT_REF_V0_KEY &&
@@ -2961,9 +3455,13 @@ static int delete_extent_records(struct btrfs_trans_handle *trans,
 			break;
 		btrfs_release_path(NULL, path);
 
-		if (found_key.type == BTRFS_EXTENT_ITEM_KEY) {
+		if (found_key.type == BTRFS_EXTENT_ITEM_KEY ||
+		    found_key.type == BTRFS_METADATA_ITEM_KEY) {
+			u64 bytes = (found_key.type == BTRFS_EXTENT_ITEM_KEY) ?
+				found_key.offset : root->leafsize;
+
 			ret = btrfs_update_block_group(trans, root, bytenr,
-						       found_key.offset, 0, 0);
+						       bytes, 0, 0);
 			if (ret)
 				break;
 		}
@@ -3128,7 +3626,8 @@ static int fixup_extent_refs(struct btrfs_trans_handle *trans,
 
 	/* remember our flags for recreating the extent */
 	ret = btrfs_lookup_extent_info(NULL, info->extent_root, rec->start,
-				       rec->max_size, NULL, &flags);
+				       rec->max_size, rec->metadata, NULL,
+				       &flags);
 	if (ret < 0)
 		flags = BTRFS_BLOCK_FLAG_FULL_BACKREF;
 
@@ -3609,9 +4108,11 @@ int cmd_check(int argc, char **argv)
 		return -EBUSY;
 	}
 
-	info = open_ctree_fs_info(argv[optind], bytenr, rw, 1);
-	if (info == NULL)
-		return 1;
+	info = open_ctree_fs_info(argv[optind], bytenr, 0, rw, 1);
+	if (!info) {
+		fprintf(stderr, "Couldn't open file system\n");
+		return -EIO;
+	}
 
 	uuid_unparse(info->super_copy->fsid, uuidbuf);
 	printf("Checking filesystem on %s\nUUID: %s\n", argv[optind], uuidbuf);
@@ -3643,8 +4144,18 @@ int cmd_check(int argc, char **argv)
 	if (ret)
 		fprintf(stderr, "Errors found in extent allocation tree\n");
 
+	fprintf(stderr, "checking free space cache\n");
+	ret = check_space_cache(root);
+	if (ret)
+		goto out;
+
 	fprintf(stderr, "checking fs roots\n");
 	ret = check_fs_roots(root, &root_cache);
+	if (ret)
+		goto out;
+
+	fprintf(stderr, "checking csums\n");
+	ret = check_csums(root);
 	if (ret)
 		goto out;
 
@@ -3677,6 +4188,8 @@ out:
 	       (unsigned long long)total_btree_bytes);
 	printf("total fs tree bytes: %llu\n",
 	       (unsigned long long)total_fs_tree_bytes);
+	printf("total extent tree bytes: %llu\n",
+	       (unsigned long long)total_extent_tree_bytes);
 	printf("btree space waste bytes: %llu\n",
 	       (unsigned long long)btree_space_waste);
 	printf("file data blocks allocated: %llu\n referenced %llu\n",

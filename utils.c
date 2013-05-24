@@ -40,6 +40,7 @@
 #include <linux/major.h>
 #include <linux/kdev_t.h>
 #include <limits.h>
+#include <blkid/blkid.h>
 #include "kerncompat.h"
 #include "radix-tree.h"
 #include "ctree.h"
@@ -415,7 +416,7 @@ int make_btrfs(int fd, const char *device, const char *label,
 	return 0;
 }
 
-static u64 device_size(int fd, struct stat *st)
+u64 btrfs_device_size(int fd, struct stat *st)
 {
 	u64 size;
 	if (S_ISREG(st->st_mode)) {
@@ -481,7 +482,7 @@ int btrfs_add_to_fsid(struct btrfs_trans_handle *trans,
 	u64 num_devs;
 	int ret;
 
-	device = kmalloc(sizeof(*device), GFP_NOFS);
+	device = kzalloc(sizeof(*device), GFP_NOFS);
 	if (!device)
 		return -ENOMEM;
 	buf = kmalloc(sectorsize, GFP_NOFS);
@@ -555,7 +556,7 @@ int btrfs_prepare_device(int fd, char *file, int zero_end, u64 *block_count_ret,
 		exit(1);
 	}
 
-	block_count = device_size(fd, &st);
+	block_count = btrfs_device_size(fd, &st);
 	if (block_count == 0) {
 		fprintf(stderr, "unable to find %s size\n", file);
 		exit(1);
@@ -972,41 +973,6 @@ out_mntloop_err:
 	endmntent (f);
 
 	return ret;
-}
-
-/* Gets the mount point of btrfs filesystem that is using the specified device.
- * Returns 0 is everything is good, <0 if we have an error.
- * TODO: Fix this fucntion and check_mounted to work with multiple drive BTRFS
- * setups.
- */
-int get_mountpt(char *dev, char *mntpt, size_t size)
-{
-       struct mntent *mnt;
-       FILE *f;
-       int ret = 0;
-
-       f = setmntent("/proc/mounts", "r");
-       if (f == NULL)
-               return -errno;
-
-       while ((mnt = getmntent(f)) != NULL )
-       {
-               if (strcmp(dev, mnt->mnt_fsname) == 0)
-               {
-                       strncpy(mntpt, mnt->mnt_dir, size);
-                       if (size)
-                                mntpt[size-1] = 0;
-                       break;
-               }
-       }
-
-       if (mnt == NULL)
-       {
-               /* We didn't find an entry so lets report an error */
-               ret = -1;
-       }
-
-       return ret;
 }
 
 struct pending_dir {
@@ -1713,4 +1679,131 @@ out:
 	fclose(f);
 
 	return ret;
+}
+
+/*
+ * Check for existing filesystem or partition table on device.
+ * Returns:
+ *	 1 for existing fs or partition
+ *	 0 for nothing found
+ *	-1 for internal error
+ */
+static int
+check_overwrite(
+	char		*device)
+{
+	const char	*type;
+	blkid_probe	pr = NULL;
+	int		ret;
+	blkid_loff_t	size;
+
+	if (!device || !*device)
+		return 0;
+
+	ret = -1; /* will reset on success of all setup calls */
+
+	pr = blkid_new_probe_from_filename(device);
+	if (!pr)
+		goto out;
+
+	size = blkid_probe_get_size(pr);
+	if (size < 0)
+		goto out;
+
+	/* nothing to overwrite on a 0-length device */
+	if (size == 0) {
+		ret = 0;
+		goto out;
+	}
+
+	ret = blkid_probe_enable_partitions(pr, 1);
+	if (ret < 0)
+		goto out;
+
+	ret = blkid_do_fullprobe(pr);
+	if (ret < 0)
+		goto out;
+
+	/*
+	 * Blkid returns 1 for nothing found and 0 when it finds a signature,
+	 * but we want the exact opposite, so reverse the return value here.
+	 *
+	 * In addition print some useful diagnostics about what actually is
+	 * on the device.
+	 */
+	if (ret) {
+		ret = 0;
+		goto out;
+	}
+
+	if (!blkid_probe_lookup_value(pr, "TYPE", &type, NULL)) {
+		fprintf(stderr,
+			"%s appears to contain an existing "
+			"filesystem (%s).\n", device, type);
+	} else if (!blkid_probe_lookup_value(pr, "PTTYPE", &type, NULL)) {
+		fprintf(stderr,
+			"%s appears to contain a partition "
+			"table (%s).\n", device, type);
+	} else {
+		fprintf(stderr,
+			"%s appears to contain something weird "
+			"according to blkid\n", device);
+	}
+	ret = 1;
+
+out:
+	if (pr)
+		blkid_free_probe(pr);
+	if (ret == -1)
+		fprintf(stderr,
+			"probe of %s failed, cannot detect "
+			  "existing filesystem.\n", device);
+	return ret;
+}
+
+/* Check if disk is suitable for btrfs
+ * returns:
+ *  1: something is wrong, estr provides the error
+ *  0: all is fine
+ */
+int test_dev_for_mkfs(char *file, int force_overwrite, char *estr)
+{
+	int ret, fd;
+	size_t sz = 100;
+
+	ret = is_swap_device(file);
+	if (ret < 0) {
+		snprintf(estr, sz, "error checking %s status: %s\n", file,
+			strerror(-ret));
+		return 1;
+	}
+	if (ret == 1) {
+		snprintf(estr, sz, "%s is a swap device\n", file);
+		return 1;
+	}
+	if (!force_overwrite) {
+		if (check_overwrite(file)) {
+			snprintf(estr, sz, "Use the -f option to force overwrite.\n");
+			return 1;
+		}
+	}
+	ret = check_mounted(file);
+	if (ret < 0) {
+		snprintf(estr, sz, "error checking %s mount status\n",
+			file);
+		return 1;
+	}
+	if (ret == 1) {
+		snprintf(estr, sz, "%s is mounted\n", file);
+		return 1;
+	}
+	/* check if the device is busy */
+	fd = open(file, O_RDWR|O_EXCL);
+	if (fd < 0) {
+		snprintf(estr, sz, "unable to open %s: %s\n", file,
+			strerror(errno));
+		return 1;
+	}
+	close(fd);
+	return 0;
 }

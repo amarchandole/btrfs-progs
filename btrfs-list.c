@@ -577,13 +577,13 @@ static int resolve_root(struct root_lookup *rl, struct root_info *ri,
 
 		add_len = strlen(found->path);
 
-		/* room for / and for null */
-		tmp = malloc(add_len + 2 + len);
-		if (!tmp) {
-			perror("malloc failed");
-			exit(1);
-		}
 		if (full_path) {
+			/* room for / and for null */
+			tmp = malloc(add_len + 2 + len);
+			if (!tmp) {
+				perror("malloc failed");
+				exit(1);
+			}
 			memcpy(tmp + add_len + 1, full_path, len);
 			tmp[add_len] = '/';
 			memcpy(tmp, found->path, add_len);
@@ -775,7 +775,7 @@ static u64 find_root_gen(int fd)
 
 		if (sk->min_type != BTRFS_ROOT_ITEM_KEY)
 			break;
-		if (sk->min_objectid != BTRFS_ROOT_ITEM_KEY)
+		if (sk->min_objectid != ino_args.treeid)
 			break;
 	}
 	return max_found;
@@ -1180,7 +1180,7 @@ static int filter_full_path(struct root_info *ri, u64 data)
 
 static int filter_by_parent(struct root_info *ri, u64 data)
 {
-	return !uuid_compare(ri->puuid, (u8 *)data);
+	return !uuid_compare(ri->puuid, (u8 *)(unsigned long)data);
 }
 
 static btrfs_list_filter_func all_filter_funcs[] = {

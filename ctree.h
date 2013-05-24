@@ -37,6 +37,7 @@
 
 struct btrfs_root;
 struct btrfs_trans_handle;
+struct btrfs_free_space_ctl;
 #define BTRFS_MAGIC 0x4D5F53665248425F /* ascii _BHRfS_M, no null */
 
 #define BTRFS_MAX_LEVEL 8
@@ -277,6 +278,15 @@ struct btrfs_chunk {
 	/* additional stripes go here */
 } __attribute__ ((__packed__));
 
+#define BTRFS_FREE_SPACE_EXTENT	1
+#define BTRFS_FREE_SPACE_BITMAP	2
+
+struct btrfs_free_space_entry {
+	__le64 offset;
+	__le64 bytes;
+	u8 type;
+} __attribute__ ((__packed__));
+
 struct btrfs_free_space_header {
 	struct btrfs_disk_key location;
 	__le64 generation;
@@ -454,9 +464,10 @@ struct btrfs_super_block {
  * code was pretty buggy.  Lets not let them try anymore.
  */
 #define BTRFS_FEATURE_INCOMPAT_BIG_METADATA     (1ULL << 5)
+#define BTRFS_FEATURE_INCOMPAT_EXTENDED_IREF	(1ULL << 6)
 #define BTRFS_FEATURE_INCOMPAT_RAID56		(1ULL << 7)
+#define BTRFS_FEATURE_INCOMPAT_SKINNY_METADATA	(1ULL << 8)
 
-#define BTRFS_FEATURE_INCOMPAT_EXTENDED_IREF   (1ULL << 6)
 
 #define BTRFS_FEATURE_COMPAT_SUPP		0ULL
 #define BTRFS_FEATURE_COMPAT_RO_SUPP		0ULL
@@ -467,7 +478,8 @@ struct btrfs_super_block {
 	 BTRFS_FEATURE_INCOMPAT_BIG_METADATA |		\
 	 BTRFS_FEATURE_INCOMPAT_EXTENDED_IREF |		\
 	 BTRFS_FEATURE_INCOMPAT_RAID56 |		\
-	 BTRFS_FEATURE_INCOMPAT_MIXED_GROUPS)
+	 BTRFS_FEATURE_INCOMPAT_MIXED_GROUPS |		\
+	 BTRFS_FEATURE_INCOMPAT_SKINNY_METADATA)
 
 /*
  * A leaf is full of items. offset and size tell us where to find
@@ -871,6 +883,7 @@ struct btrfs_block_group_cache {
 	struct btrfs_key key;
 	struct btrfs_block_group_item item;
 	struct btrfs_space_info *space_info;
+	struct btrfs_free_space_ctl *free_space_ctl;
 	u64 pinned;
 	u64 flags;
 	int cached;
@@ -1042,6 +1055,12 @@ struct btrfs_root {
  * are used, and how many references there are to each block
  */
 #define BTRFS_EXTENT_ITEM_KEY	168
+
+/*
+ * The same as the BTRFS_EXTENT_ITEM_KEY, except it's metadata we already know
+ * the length, so we save the level in key->offset instead of the length.
+ */
+#define BTRFS_METADATA_ITEM_KEY	169
 
 #define BTRFS_TREE_BLOCK_REF_KEY	176
 
@@ -1391,9 +1410,11 @@ static inline u8 *btrfs_dev_extent_chunk_tree_uuid(struct btrfs_dev_extent *dev)
 
 /* struct btrfs_extent_item */
 BTRFS_SETGET_FUNCS(extent_refs, struct btrfs_extent_item, refs, 64);
+BTRFS_SETGET_STACK_FUNCS(stack_extent_refs, struct btrfs_extent_item, refs, 64);
 BTRFS_SETGET_FUNCS(extent_generation, struct btrfs_extent_item,
 		   generation, 64);
 BTRFS_SETGET_FUNCS(extent_flags, struct btrfs_extent_item, flags, 64);
+BTRFS_SETGET_STACK_FUNCS(stack_extent_flags, struct btrfs_extent_item, flags, 64);
 
 BTRFS_SETGET_FUNCS(extent_refs_v0, struct btrfs_extent_item_v0, refs, 32);
 
@@ -1429,6 +1450,10 @@ BTRFS_SETGET_FUNCS(extent_inline_ref_type, struct btrfs_extent_inline_ref,
 		   type, 8);
 BTRFS_SETGET_FUNCS(extent_inline_ref_offset, struct btrfs_extent_inline_ref,
 		   offset, 64);
+BTRFS_SETGET_STACK_FUNCS(stack_extent_inline_ref_type,
+			 struct btrfs_extent_inline_ref, type, 8);
+BTRFS_SETGET_STACK_FUNCS(stack_extent_inline_ref_offset,
+			 struct btrfs_extent_inline_ref, offset, 64);
 
 static inline u32 btrfs_extent_inline_ref_size(int type)
 {
@@ -2027,6 +2052,13 @@ static inline u32 btrfs_level_size(struct btrfs_root *root, int level) {
 	return root->nodesize;
 }
 
+static inline int btrfs_fs_incompat(struct btrfs_fs_info *fs_info, u64 flag)
+{
+	struct btrfs_super_block *disk_super;
+	disk_super = fs_info->super_copy;
+	return !!(btrfs_super_incompat_flags(disk_super) & flag);
+}
+
 /* helper function to cast into the data area of the leaf. */
 #define btrfs_item_ptr(leaf, slot, type) \
 	((type *)(btrfs_leaf_data(leaf) + \
@@ -2047,6 +2079,9 @@ int btrfs_copy_pinned(struct btrfs_root *root, struct extent_io_tree *copy);
 struct btrfs_block_group_cache *btrfs_lookup_block_group(struct
 							 btrfs_fs_info *info,
 							 u64 bytenr);
+struct btrfs_block_group_cache *btrfs_lookup_first_block_group(struct
+						       btrfs_fs_info *info,
+						       u64 bytenr);
 struct btrfs_block_group_cache *btrfs_find_block_group(struct btrfs_root *root,
 						 struct btrfs_block_group_cache
 						 *hint, u64 search_start,
@@ -2064,10 +2099,10 @@ int btrfs_alloc_extent(struct btrfs_trans_handle *trans,
 		       u64 search_end, struct btrfs_key *ins, int data);
 int btrfs_lookup_extent_info(struct btrfs_trans_handle *trans,
 			     struct btrfs_root *root, u64 bytenr,
-			     u64 num_bytes, u64 *refs, u64 *flags);
+			     u64 offset, int metadata, u64 *refs, u64 *flags);
 int btrfs_set_block_flags(struct btrfs_trans_handle *trans,
 			  struct btrfs_root *root,
-			  u64 bytenr, u64 num_bytes, u64 flags);
+			  u64 bytenr, int level, u64 flags);
 int btrfs_inc_ref(struct btrfs_trans_handle *trans, struct btrfs_root *root,
 		  struct extent_buffer *buf, int record_parent);
 int btrfs_dec_ref(struct btrfs_trans_handle *trans, struct btrfs_root *root,

@@ -89,9 +89,9 @@ int csum_tree_block_size(struct extent_buffer *buf, u16 csum_size,
 
 	if (verify) {
 		if (memcmp_extent_buffer(buf, result, 0, csum_size)) {
-			printk("checksum verify failed on %llu found %X "
-			       "wanted %X\n", (unsigned long long)buf->start,
-			       *((int *)result), *((char *)buf->data));
+			printk("checksum verify failed on %llu found %08X "
+			       "wanted %08X\n", (unsigned long long)buf->start,
+			       *((u32 *)result), *((u32*)(char *)buf->data));
 			free(result);
 			return 1;
 		}
@@ -660,11 +660,12 @@ static int find_and_setup_log_root(struct btrfs_root *tree_root,
 	fs_info->log_root_tree = log_root;
 
 	if (!extent_buffer_uptodate(log_root->node)) {
+		free_extent_buffer(log_root->node);
 		free(log_root);
+		fs_info->log_root_tree = NULL;
 		return -EIO;
 	}
 
-	free(log_root);
 	return 0;
 }
 
@@ -944,8 +945,10 @@ static struct btrfs_fs_info *__open_ctree_fd(int fp, const char *path,
 
 	if (!(btrfs_super_flags(disk_super) & BTRFS_SUPER_FLAG_METADUMP)) {
 		ret = btrfs_read_chunk_tree(chunk_root);
-		if (ret)
-			goto out_failed;
+		if (ret) {
+			printk("Couldn't read chunk tree\n");
+			goto out_chunk;
+		}
 	}
 
 	blocksize = btrfs_level_size(tree_root,
@@ -1018,6 +1021,7 @@ out_failed:
 		free_extent_buffer(fs_info->extent_root->node);
 	if (fs_info->tree_root)
 		free_extent_buffer(fs_info->tree_root->node);
+out_chunk:
 	if (fs_info->chunk_root)
 		free_extent_buffer(fs_info->chunk_root->node);
 out_devices:
@@ -1040,8 +1044,8 @@ out:
 }
 
 struct btrfs_fs_info *open_ctree_fs_info(const char *filename,
-					 u64 sb_bytenr, int writes,
-					 int partial)
+					 u64 sb_bytenr, u64 root_tree_bytenr,
+					 int writes, int partial)
 {
 	int fp;
 	struct btrfs_fs_info *info;
@@ -1055,7 +1059,8 @@ struct btrfs_fs_info *open_ctree_fs_info(const char *filename,
 		fprintf (stderr, "Could not open %s\n", filename);
 		return NULL;
 	}
-	info = __open_ctree_fd(fp, filename, sb_bytenr, 0, writes, partial);
+	info = __open_ctree_fd(fp, filename, sb_bytenr, root_tree_bytenr,
+			       writes, partial);
 	close(fp);
 	return info;
 }
@@ -1064,28 +1069,7 @@ struct btrfs_root *open_ctree(const char *filename, u64 sb_bytenr, int writes)
 {
 	struct btrfs_fs_info *info;
 
-	info = open_ctree_fs_info(filename, sb_bytenr, writes, 0);
-	if (!info)
-		return NULL;
-	return info->fs_root;
-}
-
-struct btrfs_root *open_ctree_recovery(const char *filename, u64 sb_bytenr,
-				       u64 root_tree_bytenr)
-{
-	int fp;
-	struct btrfs_fs_info *info;
-
-
-	fp = open(filename, O_RDONLY);
-	if (fp < 0) {
-		fprintf (stderr, "Could not open %s\n", filename);
-		return NULL;
-	}
-	info = __open_ctree_fd(fp, filename, sb_bytenr,
-			       root_tree_bytenr, 0, 0);
-	close(fp);
-
+	info = open_ctree_fs_info(filename, sb_bytenr, 0, writes, 0);
 	if (!info)
 		return NULL;
 	return info->fs_root;
@@ -1277,22 +1261,37 @@ int write_ctree_super(struct btrfs_trans_handle *trans,
 static int close_all_devices(struct btrfs_fs_info *fs_info)
 {
 	struct list_head *list;
-	struct list_head *next;
 	struct btrfs_device *device;
 
-	return 0;
-
 	list = &fs_info->fs_devices->devices;
-	list_for_each(next, list) {
-		device = list_entry(next, struct btrfs_device, dev_list);
+	while (!list_empty(list)) {
+		device = list_entry(list->next, struct btrfs_device, dev_list);
+		list_del_init(&device->dev_list);
 		if (device->fd) {
 			fsync(device->fd);
 			if (posix_fadvise(device->fd, 0, 0, POSIX_FADV_DONTNEED))
 				fprintf(stderr, "Warning, could not drop caches\n");
 		}
 		close(device->fd);
+		kfree(device->name);
+		kfree(device->label);
+		kfree(device);
 	}
+	kfree(fs_info->fs_devices);
 	return 0;
+}
+
+static void free_mapping_cache(struct btrfs_fs_info *fs_info)
+{
+	struct cache_tree *cache_tree = &fs_info->mapping_tree.cache_tree;
+	struct cache_extent *ce;
+	struct map_lookup *map;
+
+	while ((ce = find_first_cache_extent(cache_tree, 0))) {
+		map = container_of(ce, struct map_lookup, ce);
+		remove_cache_extent(cache_tree, ce);
+		kfree(map);
+	}
 }
 
 int close_ctree(struct btrfs_root *root)
@@ -1335,6 +1334,7 @@ int close_ctree(struct btrfs_root *root)
 	}
 
 	close_all_devices(fs_info);
+	free_mapping_cache(fs_info);
 	extent_io_tree_cleanup(&fs_info->extent_cache);
 	extent_io_tree_cleanup(&fs_info->free_space_cache);
 	extent_io_tree_cleanup(&fs_info->block_group_cache);

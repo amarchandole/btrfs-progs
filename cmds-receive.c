@@ -45,6 +45,7 @@
 #include "commands.h"
 #include "utils.h"
 #include "list.h"
+#include "btrfs-list.h"
 
 #include "send.h"
 #include "send-stream.h"
@@ -55,17 +56,20 @@ static int g_verbose = 0;
 struct btrfs_receive
 {
 	int mnt_fd;
+	int dest_dir_fd;
 
 	int write_fd;
 	char *write_path;
 
 	char *root_path;
+	char *dest_dir_path; /* relative to root_path */
 	char *full_subvol_path;
 
 	struct subvol_info *cur_subvol;
-	struct subvol_info *parent_subvol;
 
 	struct subvol_uuid_search sus;
+
+	int honor_end_cmd;
 };
 
 static int finish_subvol(struct btrfs_receive *r)
@@ -125,6 +129,9 @@ static int finish_subvol(struct btrfs_receive *r)
 		goto out;
 	}
 
+	ret = btrfs_list_get_path_rootid(subvol_fd, &r->cur_subvol->root_id);
+	if (ret < 0)
+		goto out;
 	subvol_uuid_search_add(&r->sus, r->cur_subvol);
 	r->cur_subvol = NULL;
 	ret = 0;
@@ -148,10 +155,13 @@ static int process_subvol(const char *path, const u8 *uuid, u64 ctransid,
 		goto out;
 
 	r->cur_subvol = calloc(1, sizeof(*r->cur_subvol));
-	r->parent_subvol = NULL;
 
-	r->cur_subvol->path = strdup(path);
-	r->full_subvol_path = path_cat(r->root_path, path);
+	if (strlen(r->dest_dir_path) == 0)
+		r->cur_subvol->path = strdup(path);
+	else
+		r->cur_subvol->path = path_cat(r->dest_dir_path, path);
+	free(r->full_subvol_path);
+	r->full_subvol_path = path_cat3(r->root_path, r->dest_dir_path, path);
 
 	fprintf(stderr, "At subvol %s\n", path);
 
@@ -167,7 +177,7 @@ static int process_subvol(const char *path, const u8 *uuid, u64 ctransid,
 
 	memset(&args_v1, 0, sizeof(args_v1));
 	strncpy_null(args_v1.name, path);
-	ret = ioctl(r->mnt_fd, BTRFS_IOC_SUBVOL_CREATE, &args_v1);
+	ret = ioctl(r->dest_dir_fd, BTRFS_IOC_SUBVOL_CREATE, &args_v1);
 	if (ret < 0) {
 		ret = -errno;
 		fprintf(stderr, "ERROR: creating subvolume %s failed. "
@@ -187,16 +197,20 @@ static int process_snapshot(const char *path, const u8 *uuid, u64 ctransid,
 	struct btrfs_receive *r = user;
 	char uuid_str[128];
 	struct btrfs_ioctl_vol_args_v2 args_v2;
+	struct subvol_info *parent_subvol;
 
 	ret = finish_subvol(r);
 	if (ret < 0)
 		goto out;
 
 	r->cur_subvol = calloc(1, sizeof(*r->cur_subvol));
-	r->parent_subvol = NULL;
 
-	r->cur_subvol->path = strdup(path);
-	r->full_subvol_path = path_cat(r->root_path, path);
+	if (strlen(r->dest_dir_path) == 0)
+		r->cur_subvol->path = strdup(path);
+	else
+		r->cur_subvol->path = path_cat(r->dest_dir_path, path);
+	free(r->full_subvol_path);
+	r->full_subvol_path = path_cat3(r->root_path, r->dest_dir_path, path);
 
 	fprintf(stderr, "At snapshot %s\n", path);
 
@@ -216,9 +230,9 @@ static int process_snapshot(const char *path, const u8 *uuid, u64 ctransid,
 	memset(&args_v2, 0, sizeof(args_v2));
 	strncpy_null(args_v2.name, path);
 
-	r->parent_subvol = subvol_uuid_search(&r->sus, 0, parent_uuid,
+	parent_subvol = subvol_uuid_search(&r->sus, 0, parent_uuid,
 			parent_ctransid, NULL, subvol_search_by_received_uuid);
-	if (!r->parent_subvol) {
+	if (!parent_subvol) {
 		ret = -ENOENT;
 		fprintf(stderr, "ERROR: could not find parent subvolume\n");
 		goto out;
@@ -234,21 +248,21 @@ static int process_snapshot(const char *path, const u8 *uuid, u64 ctransid,
 		}
 	}*/
 
-	args_v2.fd = openat(r->mnt_fd, r->parent_subvol->path,
+	args_v2.fd = openat(r->mnt_fd, parent_subvol->path,
 			O_RDONLY | O_NOATIME);
 	if (args_v2.fd < 0) {
 		ret = -errno;
 		fprintf(stderr, "ERROR: open %s failed. %s\n",
-				r->parent_subvol->path, strerror(-ret));
+				parent_subvol->path, strerror(-ret));
 		goto out;
 	}
 
-	ret = ioctl(r->mnt_fd, BTRFS_IOC_SNAP_CREATE_V2, &args_v2);
+	ret = ioctl(r->dest_dir_fd, BTRFS_IOC_SNAP_CREATE_V2, &args_v2);
 	close(args_v2.fd);
 	if (ret < 0) {
 		ret = -errno;
 		fprintf(stderr, "ERROR: creating snapshot %s -> %s "
-				"failed. %s\n", r->parent_subvol->path,
+				"failed. %s\n", parent_subvol->path,
 				path, strerror(-ret));
 		goto out;
 	}
@@ -263,7 +277,7 @@ static int process_mkfile(const char *path, void *user)
 	struct btrfs_receive *r = user;
 	char *full_path = path_cat(r->full_subvol_path, path);
 
-	if (g_verbose >= 1)
+	if (g_verbose >= 2)
 		fprintf(stderr, "mkfile %s\n", path);
 
 	ret = creat(full_path, 0600);
@@ -287,7 +301,7 @@ static int process_mkdir(const char *path, void *user)
 	struct btrfs_receive *r = user;
 	char *full_path = path_cat(r->full_subvol_path, path);
 
-	if (g_verbose >= 1)
+	if (g_verbose >= 2)
 		fprintf(stderr, "mkdir %s\n", path);
 
 	ret = mkdir(full_path, 0700);
@@ -307,7 +321,7 @@ static int process_mknod(const char *path, u64 mode, u64 dev, void *user)
 	struct btrfs_receive *r = user;
 	char *full_path = path_cat(r->full_subvol_path, path);
 
-	if (g_verbose >= 1)
+	if (g_verbose >= 2)
 		fprintf(stderr, "mknod %s mode=%llu, dev=%llu\n",
 				path, mode, dev);
 
@@ -328,7 +342,7 @@ static int process_mkfifo(const char *path, void *user)
 	struct btrfs_receive *r = user;
 	char *full_path = path_cat(r->full_subvol_path, path);
 
-	if (g_verbose >= 1)
+	if (g_verbose >= 2)
 		fprintf(stderr, "mkfifo %s\n", path);
 
 	ret = mkfifo(full_path, 0600);
@@ -348,7 +362,7 @@ static int process_mksock(const char *path, void *user)
 	struct btrfs_receive *r = user;
 	char *full_path = path_cat(r->full_subvol_path, path);
 
-	if (g_verbose >= 1)
+	if (g_verbose >= 2)
 		fprintf(stderr, "mksock %s\n", path);
 
 	ret = mknod(full_path, 0600 | S_IFSOCK, 0);
@@ -368,7 +382,7 @@ static int process_symlink(const char *path, const char *lnk, void *user)
 	struct btrfs_receive *r = user;
 	char *full_path = path_cat(r->full_subvol_path, path);
 
-	if (g_verbose >= 1)
+	if (g_verbose >= 2)
 		fprintf(stderr, "symlink %s -> %s\n", path, lnk);
 
 	ret = symlink(lnk, full_path);
@@ -389,7 +403,7 @@ static int process_rename(const char *from, const char *to, void *user)
 	char *full_from = path_cat(r->full_subvol_path, from);
 	char *full_to = path_cat(r->full_subvol_path, to);
 
-	if (g_verbose >= 1)
+	if (g_verbose >= 2)
 		fprintf(stderr, "rename %s -> %s\n", from, to);
 
 	ret = rename(full_from, full_to);
@@ -411,7 +425,7 @@ static int process_link(const char *path, const char *lnk, void *user)
 	char *full_path = path_cat(r->full_subvol_path, path);
 	char *full_link_path = path_cat(r->full_subvol_path, lnk);
 
-	if (g_verbose >= 1)
+	if (g_verbose >= 2)
 		fprintf(stderr, "link %s -> %s\n", path, lnk);
 
 	ret = link(full_link_path, full_path);
@@ -433,7 +447,7 @@ static int process_unlink(const char *path, void *user)
 	struct btrfs_receive *r = user;
 	char *full_path = path_cat(r->full_subvol_path, path);
 
-	if (g_verbose >= 1)
+	if (g_verbose >= 2)
 		fprintf(stderr, "unlink %s\n", path);
 
 	ret = unlink(full_path);
@@ -453,7 +467,7 @@ static int process_rmdir(const char *path, void *user)
 	struct btrfs_receive *r = user;
 	char *full_path = path_cat(r->full_subvol_path, path);
 
-	if (g_verbose >= 1)
+	if (g_verbose >= 2)
 		fprintf(stderr, "rmdir %s\n", path);
 
 	ret = rmdir(full_path);
@@ -560,7 +574,7 @@ static int process_clone(const char *path, u64 offset, u64 len,
 			subvol_search_by_received_uuid);
 	if (!si) {
 		if (memcmp(clone_uuid, r->cur_subvol->received_uuid,
-				BTRFS_FSID_SIZE) == 0) {
+				BTRFS_UUID_SIZE) == 0) {
 			/* TODO check generation of extent */
 			subvol_path = strdup(r->cur_subvol->path);
 		} else {
@@ -626,7 +640,7 @@ static int process_set_xattr(const char *path, const char *name,
 	struct btrfs_receive *r = user;
 	char *full_path = path_cat(r->full_subvol_path, path);
 
-	if (g_verbose >= 1) {
+	if (g_verbose >= 2) {
 		fprintf(stderr, "set_xattr %s - name=%s data_len=%d "
 				"data=%.*s\n", path, name, len,
 				len, (char*)data);
@@ -651,7 +665,7 @@ static int process_remove_xattr(const char *path, const char *name, void *user)
 	struct btrfs_receive *r = user;
 	char *full_path = path_cat(r->full_subvol_path, path);
 
-	if (g_verbose >= 1) {
+	if (g_verbose >= 2) {
 		fprintf(stderr, "remove_xattr %s - name=%s\n",
 				path, name);
 	}
@@ -675,7 +689,7 @@ static int process_truncate(const char *path, u64 size, void *user)
 	struct btrfs_receive *r = user;
 	char *full_path = path_cat(r->full_subvol_path, path);
 
-	if (g_verbose >= 1)
+	if (g_verbose >= 2)
 		fprintf(stderr, "truncate %s size=%llu\n", path, size);
 
 	ret = truncate(full_path, size);
@@ -697,7 +711,7 @@ static int process_chmod(const char *path, u64 mode, void *user)
 	struct btrfs_receive *r = user;
 	char *full_path = path_cat(r->full_subvol_path, path);
 
-	if (g_verbose >= 1)
+	if (g_verbose >= 2)
 		fprintf(stderr, "chmod %s - mode=0%o\n", path, (int)mode);
 
 	ret = chmod(full_path, mode);
@@ -719,7 +733,7 @@ static int process_chown(const char *path, u64 uid, u64 gid, void *user)
 	struct btrfs_receive *r = user;
 	char *full_path = path_cat(r->full_subvol_path, path);
 
-	if (g_verbose >= 1)
+	if (g_verbose >= 2)
 		fprintf(stderr, "chown %s - uid=%llu, gid=%llu\n", path,
 				uid, gid);
 
@@ -745,12 +759,12 @@ static int process_utimes(const char *path, struct timespec *at,
 	char *full_path = path_cat(r->full_subvol_path, path);
 	struct timespec tv[2];
 
-	if (g_verbose >= 1)
+	if (g_verbose >= 2)
 		fprintf(stderr, "utimes %s\n", path);
 
 	tv[0] = *at;
 	tv[1] = *mt;
-	ret = utimensat(-1, full_path, tv, AT_SYMLINK_NOFOLLOW);
+	ret = utimensat(AT_FDCWD, full_path, tv, AT_SYMLINK_NOFOLLOW);
 	if (ret < 0) {
 		ret = -errno;
 		fprintf(stderr, "ERROR: utimes %s failed. %s\n",
@@ -790,25 +804,56 @@ struct btrfs_send_ops send_ops = {
 int do_receive(struct btrfs_receive *r, const char *tomnt, int r_fd)
 {
 	int ret;
+	char *dest_dir_full_path;
 	int end = 0;
 
-	r->root_path = strdup(tomnt);
-	r->mnt_fd = open(tomnt, O_RDONLY | O_NOATIME);
-	if (r->mnt_fd < 0) {
+	dest_dir_full_path = realpath(tomnt, NULL);
+	if (!dest_dir_full_path) {
 		ret = -errno;
-		fprintf(stderr, "ERROR: failed to open %s. %s\n", tomnt,
-				strerror(-ret));
+		fprintf(stderr, "ERROR: realpath(%s) failed. %s\n", tomnt,
+			strerror(-ret));
+		goto out;
+	}
+	r->dest_dir_fd = open(dest_dir_full_path, O_RDONLY | O_NOATIME);
+	if (r->dest_dir_fd < 0) {
+		ret = -errno;
+		fprintf(stderr,
+			"ERROR: failed to open destination directory %s. %s\n",
+			dest_dir_full_path, strerror(-ret));
 		goto out;
 	}
 
+	ret = find_mount_root(dest_dir_full_path, &r->root_path);
+	if (ret < 0) {
+		ret = -EINVAL;
+		fprintf(stderr, "ERROR: failed to determine mount point "
+			"for %s\n", dest_dir_full_path);
+		goto out;
+	}
+	r->mnt_fd = open(r->root_path, O_RDONLY | O_NOATIME);
+	if (r->mnt_fd < 0) {
+		ret = -errno;
+		fprintf(stderr, "ERROR: failed to open %s. %s\n", r->root_path,
+			strerror(-ret));
+		goto out;
+	}
+
+	/*
+	 * find_mount_root returns a root_path that is a subpath of
+	 * dest_dir_full_path. Now get the other part of root_path,
+	 * which is the destination dir relative to root_path.
+	 */
+	r->dest_dir_path = dest_dir_full_path + strlen(r->root_path);
+	while (r->dest_dir_path[0] == '/')
+		r->dest_dir_path++;
+
 	ret = subvol_uuid_search_init(r->mnt_fd, &r->sus);
 	if (ret < 0)
-		return ret;
-
-	r->write_fd = -1;
+		goto out;
 
 	while (!end) {
-		ret = btrfs_read_and_process_send_stream(r_fd, &send_ops, r);
+		ret = btrfs_read_and_process_send_stream(r_fd, &send_ops, r,
+							 r->honor_end_cmd);
 		if (ret < 0)
 			goto out;
 		if (ret)
@@ -824,6 +869,32 @@ int do_receive(struct btrfs_receive *r, const char *tomnt, int r_fd)
 	ret = 0;
 
 out:
+	if (r->write_fd != -1) {
+		close(r->write_fd);
+		r->write_fd = -1;
+	}
+	free(r->root_path);
+	r->root_path = NULL;
+	free(r->write_path);
+	r->write_path = NULL;
+	free(r->full_subvol_path);
+	r->full_subvol_path = NULL;
+	r->dest_dir_path = NULL;
+	free(dest_dir_full_path);
+	if (r->cur_subvol) {
+		free(r->cur_subvol->path);
+		free(r->cur_subvol);
+		r->cur_subvol = NULL;
+	}
+	subvol_uuid_search_finit(&r->sus);
+	if (r->mnt_fd != -1) {
+		close(r->mnt_fd);
+		r->mnt_fd = -1;
+	}
+	if (r->dest_dir_fd != -1) {
+		close(r->dest_dir_fd);
+		r->dest_dir_fd = -1;
+	}
 	return ret;
 }
 
@@ -838,14 +909,20 @@ static int do_cmd_receive(int argc, char **argv)
 	int ret;
 
 	memset(&r, 0, sizeof(r));
+	r.mnt_fd = -1;
+	r.write_fd = -1;
+	r.dest_dir_fd = -1;
 
-	while ((c = getopt(argc, argv, "vf:")) != -1) {
+	while ((c = getopt(argc, argv, "evf:")) != -1) {
 		switch (c) {
 		case 'v':
 			g_verbose++;
 			break;
 		case 'f':
 			fromfile = optarg;
+			break;
+		case 'e':
+			r.honor_end_cmd = 1;
 			break;
 		case '?':
 		default:
@@ -880,7 +957,7 @@ static const char * const receive_cmd_group_usage[] = {
 };
 
 const char * const cmd_receive_usage[] = {
-	"btrfs receive [-v] [-f <infile>] <mount>",
+	"btrfs receive [-ve] [-f <infile>] <mount>",
 	"Receive subvolumes from stdin.",
 	"Receives one or more subvolumes that were previously ",
 	"sent with btrfs send. The received subvolumes are stored",
@@ -896,6 +973,10 @@ const char * const cmd_receive_usage[] = {
 	"-f <infile>      By default, btrfs receive uses stdin",
 	"                 to receive the subvolumes. Use this",
 	"                 option to specify a file to use instead.",
+	"-e               Terminate after receiving an <end cmd>",
+	"                 in the data stream. Without this option,",
+	"                 the receiver terminates only if an error",
+	"                 is recognized or on EOF.",
 	NULL
 };
 

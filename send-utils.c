@@ -23,6 +23,105 @@
 #include "ioctl.h"
 #include "btrfs-list.h"
 
+static int btrfs_subvolid_resolve_sub(int fd, char *path, size_t *path_len,
+				      u64 subvol_id);
+
+int btrfs_subvolid_resolve(int fd, char *path, size_t path_len, u64 subvol_id)
+{
+	if (path_len < 1)
+		return -EOVERFLOW;
+	path[0] = '\0';
+	path_len--;
+	path[path_len] = '\0';
+	return btrfs_subvolid_resolve_sub(fd, path, &path_len, subvol_id);
+}
+
+static int btrfs_subvolid_resolve_sub(int fd, char *path, size_t *path_len,
+				      u64 subvol_id)
+{
+	int ret;
+	struct btrfs_ioctl_search_args search_arg;
+	struct btrfs_ioctl_ino_lookup_args ino_lookup_arg;
+	struct btrfs_ioctl_search_header *search_header;
+	struct btrfs_root_ref *backref_item;
+
+	if (subvol_id == BTRFS_FS_TREE_OBJECTID) {
+		if (*path_len < 1)
+			return -EOVERFLOW;
+		*path = '\0';
+		(*path_len)--;
+		return 0;
+	}
+
+	memset(&search_arg, 0, sizeof(search_arg));
+	search_arg.key.tree_id = BTRFS_ROOT_TREE_OBJECTID;
+	search_arg.key.min_objectid = subvol_id;
+	search_arg.key.max_objectid = subvol_id;
+	search_arg.key.min_type = BTRFS_ROOT_BACKREF_KEY;
+	search_arg.key.max_type = BTRFS_ROOT_BACKREF_KEY;
+	search_arg.key.max_offset = (u64)-1;
+	search_arg.key.max_transid = (u64)-1;
+	search_arg.key.nr_items = 1;
+	ret = ioctl(fd, BTRFS_IOC_TREE_SEARCH, &search_arg);
+	if (ret) {
+		fprintf(stderr,
+			"ioctl(BTRFS_IOC_TREE_SEARCH, subvol_id %llu) ret=%d, error: %s\n",
+			(unsigned long long)subvol_id, ret, strerror(errno));
+		return ret;
+	}
+
+	if (search_arg.key.nr_items < 1) {
+		fprintf(stderr,
+			"failed to lookup subvol_id %llu!\n",
+			(unsigned long long)subvol_id);
+		return -ENOENT;
+	}
+	search_header = (struct btrfs_ioctl_search_header *)search_arg.buf;
+	backref_item = (struct btrfs_root_ref *)(search_header + 1);
+	if (search_header->offset != BTRFS_FS_TREE_OBJECTID) {
+		int sub_ret;
+
+		sub_ret = btrfs_subvolid_resolve_sub(fd, path, path_len,
+						     search_header->offset);
+		if (sub_ret)
+			return sub_ret;
+		if (*path_len < 1)
+			return -EOVERFLOW;
+		strcat(path, "/");
+		(*path_len)--;
+	}
+
+	if (btrfs_stack_root_ref_dirid(backref_item) !=
+	    BTRFS_FIRST_FREE_OBJECTID) {
+		int len;
+
+		memset(&ino_lookup_arg, 0, sizeof(ino_lookup_arg));
+		ino_lookup_arg.treeid = search_header->offset;
+		ino_lookup_arg.objectid =
+			btrfs_stack_root_ref_dirid(backref_item);
+		ret = ioctl(fd, BTRFS_IOC_INO_LOOKUP, &ino_lookup_arg);
+		if (ret) {
+			fprintf(stderr,
+				"ioctl(BTRFS_IOC_INO_LOOKUP) ret=%d, error: %s\n",
+				ret, strerror(errno));
+			return ret;
+		}
+
+		len = strlen(ino_lookup_arg.name);
+		if (*path_len < len)
+			return -EOVERFLOW;
+		strcat(path, ino_lookup_arg.name);
+		(*path_len) -= len;
+	}
+
+	if (*path_len < btrfs_stack_root_ref_name_len(backref_item))
+		return -EOVERFLOW;
+	strncat(path, (char *)(backref_item + 1),
+		btrfs_stack_root_ref_name_len(backref_item));
+	(*path_len) -= btrfs_stack_root_ref_name_len(backref_item);
+	return 0;
+}
+
 static struct rb_node *tree_insert(struct rb_root *root,
 				   struct subvol_info *si,
 				   enum subvol_search_type type)
@@ -226,7 +325,7 @@ int subvol_uuid_search_init(int mnt_fd, struct subvol_uuid_search *s)
 
 			if ((sh->objectid != 5 &&
 			    sh->objectid < BTRFS_FIRST_FREE_OBJECTID) ||
-			    sh->objectid == BTRFS_FREE_INO_OBJECTID)
+			    sh->objectid > BTRFS_LAST_FREE_OBJECTID)
 				goto skip;
 
 			if (sh->type == BTRFS_ROOT_ITEM_KEY) {
@@ -304,12 +403,35 @@ out:
 	return ret;
 }
 
+/*
+ * It's safe to call this function even without the subvol_uuid_search_init()
+ * call before as long as the subvol_uuid_search structure is all-zero.
+ */
+void subvol_uuid_search_finit(struct subvol_uuid_search *s)
+{
+	struct rb_root *root = &s->root_id_subvols;
+	struct rb_node *node;
+
+	while ((node = rb_first(root))) {
+		struct subvol_info *entry =
+			rb_entry(node, struct subvol_info, rb_root_id_node);
+
+		free(entry->path);
+		rb_erase(node, root);
+		free(entry);
+	}
+
+	s->root_id_subvols = RB_ROOT;
+	s->local_subvols = RB_ROOT;
+	s->received_subvols = RB_ROOT;
+	s->path_subvols = RB_ROOT;
+}
 
 char *path_cat(const char *p1, const char *p2)
 {
 	int p1_len = strlen(p1);
 	int p2_len = strlen(p2);
-	char *new = malloc(p1_len + p2_len + 3);
+	char *new = malloc(p1_len + p2_len + 2);
 
 	if (p1_len && p1[p1_len - 1] == '/')
 		p1_len--;
@@ -325,7 +447,7 @@ char *path_cat3(const char *p1, const char *p2, const char *p3)
 	int p1_len = strlen(p1);
 	int p2_len = strlen(p2);
 	int p3_len = strlen(p3);
-	char *new = malloc(p1_len + p2_len + p3_len + 4);
+	char *new = malloc(p1_len + p2_len + p3_len + 3);
 
 	if (p1_len && p1[p1_len - 1] == '/')
 		p1_len--;
