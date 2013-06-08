@@ -74,31 +74,36 @@ static int make_root_dir(struct btrfs_root *root, int mixed)
 				     BTRFS_BLOCK_GROUP_SYSTEM,
 				     BTRFS_FIRST_CHUNK_TREE_OBJECTID,
 				     0, BTRFS_MKFS_SYSTEM_GROUP_SIZE);
-	BUG_ON(ret);
+	if (ret)
+		goto err;
 
 	if (mixed) {
 		ret = btrfs_alloc_chunk(trans, root->fs_info->extent_root,
 					&chunk_start, &chunk_size,
 					BTRFS_BLOCK_GROUP_METADATA |
 					BTRFS_BLOCK_GROUP_DATA);
-		BUG_ON(ret);
+		if (ret)
+			goto err;
 		ret = btrfs_make_block_group(trans, root, 0,
 					     BTRFS_BLOCK_GROUP_METADATA |
 					     BTRFS_BLOCK_GROUP_DATA,
 					     BTRFS_FIRST_CHUNK_TREE_OBJECTID,
 					     chunk_start, chunk_size);
-		BUG_ON(ret);
+		if (ret)
+			goto err;
 		printf("Created a data/metadata chunk of size %llu\n", chunk_size);
 	} else {
 		ret = btrfs_alloc_chunk(trans, root->fs_info->extent_root,
 					&chunk_start, &chunk_size,
 					BTRFS_BLOCK_GROUP_METADATA);
-		BUG_ON(ret);
+		if (ret)
+			goto err;
 		ret = btrfs_make_block_group(trans, root, 0,
 					     BTRFS_BLOCK_GROUP_METADATA,
 					     BTRFS_FIRST_CHUNK_TREE_OBJECTID,
 					     chunk_start, chunk_size);
-		BUG_ON(ret);
+		if (ret)
+			goto err;
 	}
 
 	root->fs_info->system_allocs = 0;
@@ -110,12 +115,14 @@ static int make_root_dir(struct btrfs_root *root, int mixed)
 		ret = btrfs_alloc_chunk(trans, root->fs_info->extent_root,
 					&chunk_start, &chunk_size,
 					BTRFS_BLOCK_GROUP_DATA);
-		BUG_ON(ret);
+		if (ret)
+			goto err;
 		ret = btrfs_make_block_group(trans, root, 0,
 					     BTRFS_BLOCK_GROUP_DATA,
 					     BTRFS_FIRST_CHUNK_TREE_OBJECTID,
 					     chunk_start, chunk_size);
-		BUG_ON(ret);
+		if (ret)
+			goto err;
 	}
 
 	ret = btrfs_make_root_dir(trans, root->fs_info->tree_root,
@@ -1460,7 +1467,7 @@ int main(int ac, char **av)
 
 	ret = make_root_dir(root, mixed);
 	if (ret) {
-		fprintf(stderr, "failed to setup the root directory\n");
+		fprintf(stderr, "failed to setup the root directory %d\n", ret);
 		exit(1);
 	}
 
