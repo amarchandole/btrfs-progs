@@ -245,24 +245,22 @@ static int noinline find_search_start(struct btrfs_root *root,
 {
 	int ret;
 	struct btrfs_block_group_cache *cache = *cache_ret;
-	u64 last;
+	u64 last = *start_ret;
 	u64 start = 0;
 	u64 end = 0;
 	u64 search_start = *start_ret;
 	int wrapped = 0;
 
-	if (!cache) {
+	if (!cache)
 		goto out;
-	}
 again:
 	ret = cache_block_group(root, cache);
 	if (ret)
 		goto out;
 
 	last = max(search_start, cache->key.objectid);
-	if (cache->ro || !block_group_bits(cache, data)) {
+	if (cache->ro || !block_group_bits(cache, data))
 		goto new_group;
-	}
 
 	while(1) {
 		ret = find_first_extent_bit(&root->fs_info->free_space_cache,
@@ -283,6 +281,7 @@ again:
 		return 0;
 	}
 out:
+	*start_ret = last;
 	cache = btrfs_lookup_block_group(root->fs_info, search_start);
 	if (!cache) {
 		printk("Unable to find block group for %llu\n",
@@ -296,7 +295,6 @@ new_group:
 wrapped:
 	cache = btrfs_lookup_first_block_group(root->fs_info, last);
 	if (!cache) {
-no_cache:
 		if (!wrapped) {
 			wrapped = 1;
 			last = search_start;
@@ -304,11 +302,6 @@ no_cache:
 		}
 		goto out;
 	}
-	cache = btrfs_find_block_group(root, cache, last, data, 0);
-	cache = btrfs_find_block_group(root, cache, last, data, 0);
-	if (!cache)
-		goto no_cache;
-
 	*cache_ret = cache;
 	goto again;
 }
@@ -2182,6 +2175,12 @@ void btrfs_pin_extent(struct btrfs_fs_info *fs_info,
 	update_pinned_extents(fs_info->extent_root, bytenr, num_bytes, 1);
 }
 
+void btrfs_unpin_extent(struct btrfs_fs_info *fs_info,
+			u64 bytenr, u64 num_bytes)
+{
+	update_pinned_extents(fs_info->extent_root, bytenr, num_bytes, 0);
+}
+
 /*
  * remove an extent from the root, returns 0 on success
  */
@@ -2593,7 +2592,7 @@ check_failed:
 	ret = find_search_start(root, &block_group, &search_start,
 				total_needed, data);
 	if (ret)
-		goto error;
+		goto new_group;
 
 	ins->objectid = search_start;
 	ins->offset = num_bytes;
@@ -3329,19 +3328,16 @@ error:
 	return ret;
 }
 
-int btrfs_make_block_group(struct btrfs_trans_handle *trans,
-			   struct btrfs_root *root, u64 bytes_used,
-			   u64 type, u64 chunk_objectid, u64 chunk_offset,
-			   u64 size)
+struct btrfs_block_group_cache *
+btrfs_add_block_group(struct btrfs_fs_info *fs_info, u64 bytes_used, u64 type,
+		      u64 chunk_objectid, u64 chunk_offset, u64 size)
 {
 	int ret;
 	int bit = 0;
-	struct btrfs_root *extent_root;
 	struct btrfs_block_group_cache *cache;
 	struct extent_io_tree *block_group_cache;
 
-	extent_root = root->fs_info->extent_root;
-	block_group_cache = &root->fs_info->block_group_cache;
+	block_group_cache = &fs_info->block_group_cache;
 
 	cache = kzalloc(sizeof(*cache), GFP_NOFS);
 	BUG_ON(!cache);
@@ -3354,7 +3350,7 @@ int btrfs_make_block_group(struct btrfs_trans_handle *trans,
 	cache->flags = type;
 	btrfs_set_block_group_flags(&cache->item, type);
 
-	ret = update_space_info(root->fs_info, cache->flags, size, bytes_used,
+	ret = update_space_info(fs_info, cache->flags, size, bytes_used,
 				&cache->space_info);
 	BUG_ON(ret);
 
@@ -3365,13 +3361,29 @@ int btrfs_make_block_group(struct btrfs_trans_handle *trans,
 
 	set_state_private(block_group_cache, chunk_offset,
 			  (unsigned long)cache);
+	set_avail_alloc_bits(fs_info, type);
+
+	return cache;
+}
+
+int btrfs_make_block_group(struct btrfs_trans_handle *trans,
+			   struct btrfs_root *root, u64 bytes_used,
+			   u64 type, u64 chunk_objectid, u64 chunk_offset,
+			   u64 size)
+{
+	int ret;
+	struct btrfs_root *extent_root;
+	struct btrfs_block_group_cache *cache;
+
+	cache = btrfs_add_block_group(root->fs_info, bytes_used, type,
+				      chunk_objectid, chunk_offset, size);
+	extent_root = root->fs_info->extent_root;
 	ret = btrfs_insert_item(trans, extent_root, &cache->key, &cache->item,
 				sizeof(cache->item));
 	BUG_ON(ret);
 
 	finish_current_insert(trans, extent_root);
 	ret = del_pending_extents(trans, extent_root);
-	set_avail_alloc_bits(extent_root->fs_info, type);
 	return 0;
 }
 
