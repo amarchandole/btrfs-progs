@@ -75,27 +75,34 @@ static int cmd_subvol_create(int argc, char **argv)
 {
 	int	retval, res, len;
 	int	fddst = -1;
+	char	*dupname = NULL;
+	char	*dupdir = NULL;
 	char	*newname;
 	char	*dstdir;
 	char	*dst;
 	struct btrfs_qgroup_inherit *inherit = NULL;
+	DIR	*dirstream = NULL;
 
 	optind = 1;
 	while (1) {
-		int c = getopt(argc, argv, "c:i:r");
+		int c = getopt(argc, argv, "c:i:");
 		if (c < 0)
 			break;
 
 		switch (c) {
 		case 'c':
 			res = qgroup_inherit_add_copy(&inherit, optarg, 0);
-			if (res)
-				return res;
+			if (res) {
+				retval = res;
+				goto out;
+			}
 			break;
 		case 'i':
 			res = qgroup_inherit_add_group(&inherit, optarg);
-			if (res)
-				return res;
+			if (res) {
+				retval = res;
+				goto out;
+			}
 			break;
 		default:
 			usage(cmd_subvol_create_usage);
@@ -114,10 +121,10 @@ static int cmd_subvol_create(int argc, char **argv)
 		goto out;
 	}
 
-	newname = strdup(dst);
-	newname = basename(newname);
-	dstdir = strdup(dst);
-	dstdir = dirname(dstdir);
+	dupname = strdup(dst);
+	newname = basename(dupname);
+	dupdir = strdup(dst);
+	dstdir = dirname(dupdir);
 
 	if (!strcmp(newname, ".") || !strcmp(newname, "..") ||
 	     strchr(newname, '/') ){
@@ -133,7 +140,7 @@ static int cmd_subvol_create(int argc, char **argv)
 		goto out;
 	}
 
-	fddst = open_file_or_dir(dstdir);
+	fddst = open_file_or_dir(dstdir, &dirstream);
 	if (fddst < 0) {
 		fprintf(stderr, "ERROR: can't access to '%s'\n", dstdir);
 		goto out;
@@ -167,9 +174,10 @@ static int cmd_subvol_create(int argc, char **argv)
 
 	retval = 0;	/* success */
 out:
-	if (fddst != -1)
-		close(fddst);
+	close_file_or_dir(fddst, dirstream);
 	free(inherit);
+	free(dupname);
+	free(dupdir);
 
 	return retval;
 }
@@ -204,7 +212,10 @@ static int cmd_subvol_delete(int argc, char **argv)
 	int	res, fd, len, e, cnt = 1, ret = 0;
 	struct btrfs_ioctl_vol_args	args;
 	char	*dname, *vname, *cpath;
+	char	*dupdname = NULL;
+	char	*dupvname = NULL;
 	char	*path;
+	DIR	*dirstream = NULL;
 
 	if (argc < 2)
 		usage(cmd_subvol_delete_usage);
@@ -213,29 +224,35 @@ again:
 	path = argv[cnt];
 
 	res = test_issubvolume(path);
-	if(res<0){
+	if (res < 0) {
 		fprintf(stderr, "ERROR: error accessing '%s'\n", path);
-		ret = 12;
+		ret = 1;
 		goto out;
 	}
-	if(!res){
+	if (!res) {
 		fprintf(stderr, "ERROR: '%s' is not a subvolume\n", path);
-		ret = 13;
+		ret = 1;
 		goto out;
 	}
 
-	cpath = realpath(path, 0);
-	dname = strdup(cpath);
-	dname = dirname(dname);
-	vname = strdup(cpath);
-	vname = basename(vname);
+	cpath = realpath(path, NULL);
+	if (!cpath) {
+		ret = errno;
+		fprintf(stderr, "ERROR: finding real path for '%s': %s\n",
+			path, strerror(errno));
+		goto out;
+	}
+	dupdname = strdup(cpath);
+	dname = dirname(dupdname);
+	dupvname = strdup(cpath);
+	vname = basename(dupvname);
 	free(cpath);
 
-	if( !strcmp(vname,".") || !strcmp(vname,"..") ||
-	     strchr(vname, '/') ){
+	if (!strcmp(vname, ".") || !strcmp(vname, "..") ||
+	     strchr(vname, '/')) {
 		fprintf(stderr, "ERROR: incorrect subvolume name ('%s')\n",
 			vname);
-		ret = 14;
+		ret = 1;
 		goto out;
 	}
 
@@ -243,14 +260,14 @@ again:
 	if (len == 0 || len >= BTRFS_VOL_NAME_MAX) {
 		fprintf(stderr, "ERROR: snapshot name too long ('%s)\n",
 			vname);
-		ret = 14;
+		ret = 1;
 		goto out;
 	}
 
-	fd = open_file_or_dir(dname);
+	fd = open_file_or_dir(dname, &dirstream);
 	if (fd < 0) {
 		fprintf(stderr, "ERROR: can't access to '%s'\n", dname);
-		ret = 12;
+		ret = 1;
 		goto out;
 	}
 
@@ -259,16 +276,20 @@ again:
 	res = ioctl(fd, BTRFS_IOC_SNAP_DESTROY, &args);
 	e = errno;
 
-	close(fd);
+	close_file_or_dir(fd, dirstream);
 
 	if(res < 0 ){
 		fprintf( stderr, "ERROR: cannot delete '%s/%s' - %s\n",
 			dname, vname, strerror(e));
-		ret = 11;
+		ret = 1;
 		goto out;
 	}
 
 out:
+	free(dupdname);
+	free(dupvname);
+	dupdname = NULL;
+	dupvname = NULL;
 	cnt++;
 	if (cnt < argc)
 		goto again;
@@ -282,7 +303,7 @@ out:
  * - lowercase for enabling specific items in the output
  */
 static const char * const cmd_subvol_list_usage[] = {
-	"btrfs subvolume list [-agopurts] [-G [+|-]value] [-C [+|-]value] "
+	"btrfs subvolume list [options] [-G [+|-]value] [-C [+|-]value] "
 	"[--sort=gen,ogen,rootid,path] <path>",
 	"List subvolumes (and snapshots)",
 	"",
@@ -298,6 +319,7 @@ static const char * const cmd_subvol_list_usage[] = {
 	"-t           print the result as a table",
 	"-s           list snapshots only in the filesystem",
 	"-r           list readonly subvolumes (including snapshots)",
+	"-d           list deleted subvolumes that are not yet cleaned",
 	"-G [+|-]value",
 	"             filter the subvolumes by generation",
 	"             (+value: >= value; -value: <= value; value: = value)",
@@ -326,8 +348,9 @@ static int cmd_subvol_list(int argc, char **argv)
 	int is_only_in_path = 0;
 	struct option long_options[] = {
 		{"sort", 1, NULL, 'S'},
-		{0, 0, 0, 0}
+		{NULL, 0, NULL, 0}
 	};
+	DIR *dirstream = NULL;
 
 	filter_set = btrfs_list_alloc_filter_set();
 	comparer_set = btrfs_list_alloc_comparer_set();
@@ -335,7 +358,7 @@ static int cmd_subvol_list(int argc, char **argv)
 	optind = 1;
 	while(1) {
 		c = getopt_long(argc, argv,
-				    "acgopqsurG:C:t", long_options, NULL);
+				    "acdgopqsurG:C:t", long_options, NULL);
 		if (c < 0)
 			break;
 
@@ -348,6 +371,11 @@ static int cmd_subvol_list(int argc, char **argv)
 			break;
 		case 'c':
 			btrfs_list_setup_print_column(BTRFS_LIST_OGENERATION);
+			break;
+		case 'd':
+			btrfs_list_setup_filter(&filter_set,
+						BTRFS_LIST_FILTER_DELETED,
+						0);
 			break;
 		case 'g':
 			btrfs_list_setup_print_column(BTRFS_LIST_GENERATION);
@@ -420,19 +448,7 @@ static int cmd_subvol_list(int argc, char **argv)
 	}
 
 	subvol = argv[optind];
-
-	ret = test_issubvolume(subvol);
-	if (ret < 0) {
-		fprintf(stderr, "ERROR: error accessing '%s'\n", subvol);
-		goto out;
-	}
-	if (!ret) {
-		fprintf(stderr, "ERROR: '%s' is not a subvolume\n", subvol);
-		ret = -1;
-		goto out;
-	}
-
-	fd = open_file_or_dir(subvol);
+	fd = open_file_or_dir(subvol, &dirstream);
 	if (fd < 0) {
 		ret = -1;
 		fprintf(stderr, "ERROR: can't access '%s'\n", subvol);
@@ -470,24 +486,23 @@ static int cmd_subvol_list(int argc, char **argv)
 				!is_list_all && !is_only_in_path, NULL);
 
 out:
-	if (fd != -1)
-		close(fd);
+	close_file_or_dir(fd, dirstream);
 	if (filter_set)
 		btrfs_list_free_filter_set(filter_set);
 	if (comparer_set)
 		btrfs_list_free_comparer_set(comparer_set);
 	if (uerr)
 		usage(cmd_subvol_list_usage);
-
-	return ret;
+	return !!ret;
 }
 
 static const char * const cmd_snapshot_usage[] = {
-	"btrfs subvolume snapshot [-r] <source> [<dest>/]<name>",
-	"btrfs subvolume snapshot [-r] [-i <qgroupid>] <source> [<dest>/]<name>",
+	"btrfs subvolume snapshot [-r] <source> <dest>|[<dest>/]<name>",
+	"btrfs subvolume snapshot [-r] [-i <qgroupid>] <source> <dest>|[<dest>/]<name>",
 	"Create a snapshot of the subvolume",
 	"Create a writable/readonly snapshot of the subvolume <source> with",
-	"the name <name> in the <dest> directory",
+	"the name <name> in the <dest> directory.  If only <dest> is given,",
+	"the subvolume will be named the basename of <source>.",
 	"",
 	"-r             create a readonly snapshot",
 	"-i <qgroupid>  add the newly created snapshot to a qgroup. This",
@@ -501,10 +516,13 @@ static int cmd_snapshot(int argc, char **argv)
 	int	res, retval;
 	int	fd = -1, fddst = -1;
 	int	len, readonly = 0;
+	char	*dupname = NULL;
+	char	*dupdir = NULL;
 	char	*newname;
 	char	*dstdir;
 	struct btrfs_ioctl_vol_args_v2	args;
 	struct btrfs_qgroup_inherit *inherit = NULL;
+	DIR *dirstream1 = NULL, *dirstream2 = NULL;
 
 	optind = 1;
 	memset(&args, 0, sizeof(args));
@@ -516,21 +534,27 @@ static int cmd_snapshot(int argc, char **argv)
 		switch (c) {
 		case 'c':
 			res = qgroup_inherit_add_copy(&inherit, optarg, 0);
-			if (res)
-				return res;
+			if (res) {
+				retval = res;
+				goto out;
+			}
 			break;
 		case 'i':
 			res = qgroup_inherit_add_group(&inherit, optarg);
-			if (res)
-				return res;
+			if (res) {
+				retval = res;
+				goto out;
+			}
 			break;
 		case 'r':
 			readonly = 1;
 			break;
 		case 'x':
 			res = qgroup_inherit_add_copy(&inherit, optarg, 1);
-			if (res)
-				return res;
+			if (res) {
+				retval = res;
+				goto out;
+			}
 			break;
 		default:
 			usage(cmd_snapshot_usage);
@@ -561,14 +585,14 @@ static int cmd_snapshot(int argc, char **argv)
 	}
 
 	if (res > 0) {
-		newname = strdup(subvol);
-		newname = basename(newname);
+		dupname = strdup(subvol);
+		newname = basename(dupname);
 		dstdir = dst;
 	} else {
-		newname = strdup(dst);
-		newname = basename(newname);
-		dstdir = strdup(dst);
-		dstdir = dirname(dstdir);
+		dupname = strdup(dst);
+		newname = basename(dupname);
+		dupdir = strdup(dst);
+		dstdir = dirname(dupdir);
 	}
 
 	if (!strcmp(newname, ".") || !strcmp(newname, "..") ||
@@ -585,13 +609,13 @@ static int cmd_snapshot(int argc, char **argv)
 		goto out;
 	}
 
-	fddst = open_file_or_dir(dstdir);
+	fddst = open_file_or_dir(dstdir, &dirstream1);
 	if (fddst < 0) {
 		fprintf(stderr, "ERROR: can't access to '%s'\n", dstdir);
 		goto out;
 	}
 
-	fd = open_file_or_dir(subvol);
+	fd = open_file_or_dir(subvol, &dirstream2);
 	if (fd < 0) {
 		fprintf(stderr, "ERROR: can't access to '%s'\n", dstdir);
 		goto out;
@@ -625,11 +649,11 @@ static int cmd_snapshot(int argc, char **argv)
 	retval = 0;	/* success */
 
 out:
-	if (fd != -1)
-		close(fd);
-	if (fddst != -1)
-		close(fddst);
+	close_file_or_dir(fddst, dirstream1);
+	close_file_or_dir(fd, dirstream2);
 	free(inherit);
+	free(dupname);
+	free(dupdir);
 
 	return retval;
 }
@@ -647,23 +671,13 @@ static int cmd_subvol_get_default(int argc, char **argv)
 	char *subvol;
 	struct btrfs_list_filter_set *filter_set;
 	u64 default_id;
+	DIR *dirstream = NULL;
 
 	if (check_argc_exact(argc, 2))
 		usage(cmd_subvol_get_default_usage);
 
 	subvol = argv[1];
-
-	ret = test_issubvolume(subvol);
-	if (ret < 0) {
-		fprintf(stderr, "ERROR: error accessing '%s'\n", subvol);
-		return 1;
-	}
-	if (!ret) {
-		fprintf(stderr, "ERROR: '%s' is not a subvolume\n", subvol);
-		return 1;
-	}
-
-	fd = open_file_or_dir(subvol);
+	fd = open_file_or_dir(subvol, &dirstream);
 	if (fd < 0) {
 		fprintf(stderr, "ERROR: can't access '%s'\n", subvol);
 		return 1;
@@ -685,6 +699,7 @@ static int cmd_subvol_get_default(int argc, char **argv)
 	/* no need to resolve roots if FS_TREE is default */
 	if (default_id == BTRFS_FS_TREE_OBJECTID) {
 		printf("ID 5 (FS_TREE)\n");
+		ret = 0;
 		goto out;
 	}
 
@@ -704,11 +719,8 @@ static int cmd_subvol_get_default(int argc, char **argv)
 	if (filter_set)
 		btrfs_list_free_filter_set(filter_set);
 out:
-	if (fd != -1)
-		close(fd);
-	if (ret)
-		return 1;
-	return 0;
+	close_file_or_dir(fd, dirstream);
+	return !!ret;
 }
 
 static const char * const cmd_subvol_set_default_usage[] = {
@@ -723,6 +735,7 @@ static int cmd_subvol_set_default(int argc, char **argv)
 	u64	objectid;
 	char	*path;
 	char	*subvolid;
+	DIR	*dirstream = NULL;
 
 	if (check_argc_exact(argc, 3))
 		usage(cmd_subvol_set_default_usage);
@@ -736,7 +749,7 @@ static int cmd_subvol_set_default(int argc, char **argv)
 		return 1;
 	}
 
-	fd = open_file_or_dir(path);
+	fd = open_file_or_dir(path, &dirstream);
 	if (fd < 0) {
 		fprintf(stderr, "ERROR: can't access to '%s'\n", path);
 		return 1;
@@ -744,7 +757,7 @@ static int cmd_subvol_set_default(int argc, char **argv)
 
 	ret = ioctl(fd, BTRFS_IOC_DEFAULT_SUBVOL, &objectid);
 	e = errno;
-	close(fd);
+	close_file_or_dir(fd, dirstream);
 	if (ret < 0) {
 		fprintf(stderr, "ERROR: unable to set a new default subvolume - %s\n",
 			strerror(e));
@@ -765,6 +778,7 @@ static int cmd_find_new(int argc, char **argv)
 	int ret;
 	char *subvol;
 	u64 last_gen;
+	DIR *dirstream = NULL;
 
 	if (check_argc_exact(argc, 3))
 		usage(cmd_find_new_usage);
@@ -775,23 +789,30 @@ static int cmd_find_new(int argc, char **argv)
 	ret = test_issubvolume(subvol);
 	if (ret < 0) {
 		fprintf(stderr, "ERROR: error accessing '%s'\n", subvol);
-		return 12;
+		return 1;
 	}
 	if (!ret) {
 		fprintf(stderr, "ERROR: '%s' is not a subvolume\n", subvol);
-		return 13;
+		return 1;
 	}
 
-	fd = open_file_or_dir(subvol);
+	fd = open_file_or_dir(subvol, &dirstream);
 	if (fd < 0) {
 		fprintf(stderr, "ERROR: can't access '%s'\n", subvol);
-		return 12;
+		return 1;
 	}
+
+	ret = ioctl(fd, BTRFS_IOC_SYNC);
+	if (ret < 0) {
+		fprintf(stderr, "ERROR: unable to fs-syncing '%s' - %s\n",
+			subvol, strerror(errno));
+		close_file_or_dir(fd, dirstream);
+		return 1;
+	}
+
 	ret = btrfs_list_find_updated_files(fd, 0, last_gen);
-	close(fd);
-	if (ret)
-		return 19;
-	return 0;
+	close_file_or_dir(fd, dirstream);
+	return !!ret;
 }
 
 static const char * const cmd_subvol_show_usage[] = {
@@ -810,12 +831,13 @@ static int cmd_subvol_show(int argc, char **argv)
 	char raw_prefix[] = "\t\t\t\t";
 	u64 sv_id, mntid;
 	int fd = -1, mntfd = -1;
-	int ret = -1;
+	int ret = 1;
+	DIR *dirstream1 = NULL, *dirstream2 = NULL;
 
 	if (check_argc_exact(argc, 2))
 		usage(cmd_subvol_show_usage);
 
-	fullpath = realpath(argv[1], 0);
+	fullpath = realpath(argv[1], NULL);
 	if (!fullpath) {
 		fprintf(stderr, "ERROR: finding real path for '%s', %s\n",
 			argv[1], strerror(errno));
@@ -829,7 +851,6 @@ static int cmd_subvol_show(int argc, char **argv)
 	}
 	if (!ret) {
 		fprintf(stderr, "ERROR: '%s' is not a subvolume\n", fullpath);
-		ret = -1;
 		goto out;
 	}
 
@@ -839,10 +860,10 @@ static int cmd_subvol_show(int argc, char **argv)
 				"%s\n", fullpath, strerror(-ret));
 		goto out;
 	}
-	ret = -1;
+	ret = 1;
 	svpath = get_subvol_name(mnt, fullpath);
 
-	fd = open_file_or_dir(fullpath);
+	fd = open_file_or_dir(fullpath, &dirstream1);
 	if (fd < 0) {
 		fprintf(stderr, "ERROR: can't access '%s'\n", fullpath);
 		goto out;
@@ -855,7 +876,7 @@ static int cmd_subvol_show(int argc, char **argv)
 		goto out;
 	}
 
-	mntfd = open_file_or_dir(mnt);
+	mntfd = open_file_or_dir(mnt, &dirstream2);
 	if (mntfd < 0) {
 		fprintf(stderr, "ERROR: can't access '%s'\n", mnt);
 		goto out;
@@ -898,10 +919,12 @@ static int cmd_subvol_show(int argc, char **argv)
 		uuid_unparse(get_ri.puuid, uuidparse);
 	printf("\tParent uuid: \t\t%s\n", uuidparse);
 
-	if (get_ri.otime)
-		strftime(tstr, 256, "%Y-%m-%d %X",
-			 localtime(&get_ri.otime));
-	else
+	if (get_ri.otime) {
+		struct tm tm;
+
+		localtime_r(&get_ri.otime, &tm);
+		strftime(tstr, 256, "%Y-%m-%d %X", &tm);
+	} else
 		strcpy(tstr, "-");
 	printf("\tCreation time: \t\t%s\n", tstr);
 
@@ -936,16 +959,13 @@ static int cmd_subvol_show(int argc, char **argv)
 		btrfs_list_free_filter_set(filter_set);
 
 out:
-	if (mntfd >= 0)
-		close(mntfd);
-	if (fd >= 0)
-		close(fd);
+	close_file_or_dir(fd, dirstream1);
+	close_file_or_dir(mntfd, dirstream2);
 	if (mnt)
 		free(mnt);
 	if (fullpath)
 		free(fullpath);
-
-	return ret;
+	return !!ret;
 }
 
 const struct cmd_group subvolume_cmd_group = {
@@ -960,7 +980,7 @@ const struct cmd_group subvolume_cmd_group = {
 			cmd_subvol_set_default_usage, NULL, 0 },
 		{ "find-new", cmd_find_new, cmd_find_new_usage, NULL, 0 },
 		{ "show", cmd_subvol_show, cmd_subvol_show_usage, NULL, 0 },
-		{ 0, 0, 0, 0, 0 }
+		NULL_CMD_STRUCT
 	}
 };
 

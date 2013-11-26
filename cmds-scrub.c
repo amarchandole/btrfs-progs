@@ -139,7 +139,6 @@ static void print_scrub_summary(struct btrfs_scrub_progress *p)
 {
 	u64 err_cnt;
 	u64 err_cnt2;
-	char *bytes;
 
 	err_cnt = p->read_errors +
 			p->csum_errors +
@@ -151,10 +150,11 @@ static void print_scrub_summary(struct btrfs_scrub_progress *p)
 	if (p->malloc_errors)
 		printf("*** WARNING: memory allocation failed while scrubbing. "
 		       "results may be inaccurate\n");
-	bytes = pretty_sizes(p->data_bytes_scrubbed + p->tree_bytes_scrubbed);
-	printf("\ttotal bytes scrubbed: %s with %llu errors\n", bytes,
+
+	printf("\ttotal bytes scrubbed: %s with %llu errors\n",
+		pretty_size(p->data_bytes_scrubbed + p->tree_bytes_scrubbed),
 		max(err_cnt, err_cnt2));
-	free(bytes);
+
 	if (err_cnt || err_cnt2) {
 		printf("\terror details:");
 		PRINT_SCRUB_ERROR(p->read_errors, "read");
@@ -1007,7 +1007,7 @@ static struct scrub_file_record *last_dev_scrub(
 	return NULL;
 }
 
-int mkdir_p(char *path)
+static int mkdir_p(char *path)
 {
 	int i;
 	int ret;
@@ -1018,10 +1018,31 @@ int mkdir_p(char *path)
 		path[i] = '\0';
 		ret = mkdir(path, 0777);
 		if (ret && errno != EEXIST)
-			return 1;
+			return -errno;
 		path[i] = '/';
 	}
 
+	return 0;
+}
+
+static int is_scrub_running_on_fs(struct btrfs_ioctl_fs_info_args *fi_args,
+				  struct btrfs_ioctl_dev_info_args *di_args,
+				  struct scrub_file_record **past_scrubs)
+{
+	int i;
+
+	if (!fi_args || !di_args || !past_scrubs)
+		return 0;
+
+	for (i = 0; i < fi_args->num_devices; i++) {
+		struct scrub_file_record *sfr =
+			last_dev_scrub(past_scrubs, di_args[i].devid);
+
+		if (!sfr)
+			continue;
+		if (!(sfr->stats.finished || sfr->stats.canceled))
+			return 1;
+	}
 	return 0;
 }
 
@@ -1074,6 +1095,7 @@ static int scrub_start(int argc, char **argv, int resume)
 	pthread_mutex_t spc_write_mutex = PTHREAD_MUTEX_INITIALIZER;
 	void *terr;
 	u64 devid;
+	DIR *dirstream = NULL;
 
 	optind = 1;
 	while ((c = getopt(argc, argv, "BdqrRc:n:")) != -1) {
@@ -1129,11 +1151,11 @@ static int scrub_start(int argc, char **argv, int resume)
 
 	path = argv[optind];
 
-	fdmnt = open_path_or_dev_mnt(path);
+	fdmnt = open_path_or_dev_mnt(path, &dirstream);
 
 	if (fdmnt < 0) {
 		ERR(!do_quiet, "ERROR: can't access '%s'\n", path);
-		return 12;
+		return 1;
 	}
 
 	ret = get_fs_info(path, &fi_args, &di_args);
@@ -1160,6 +1182,27 @@ static int scrub_start(int argc, char **argv, int resume)
 			ERR(!do_quiet, "WARNING: failed to read status file: "
 			    "%s\n", strerror(-PTR_ERR(past_scrubs)));
 		close(fdres);
+	}
+
+	/*
+	 * check whether any involved device is already busy running a
+	 * scrub. This would cause damaged status messages and the state
+	 * "aborted" without the explanation that a scrub was already
+	 * running. Therefore check it first, prevent it and give some
+	 * feedback to the user if scrub is already running.
+	 * Note that if scrub is started with a block device as the
+	 * parameter, only that particular block device is checked. It
+	 * is a normal mode of operation to start scrub on multiple
+	 * single devices, there is no reason to prevent this.
+	 */
+	if (is_scrub_running_on_fs(&fi_args, di_args, past_scrubs)) {
+		ERR(!do_quiet,
+		    "ERROR: scrub is already running.\n"
+		    "To cancel use 'btrfs scrub cancel %s'.\n"
+		    "To see the status use 'btrfs scrub status [-d] %s'.\n",
+		    path, path);
+		err = 1;
+		goto out;
 	}
 
 	t_devs = malloc(fi_args.num_devices * sizeof(*t_devs));
@@ -1218,8 +1261,7 @@ static int scrub_start(int argc, char **argv, int resume)
 		if (!do_quiet)
 			printf("scrub: nothing to resume for %s, fsid %s\n",
 			       path, fsid);
-		err = 0;
-		goto out;
+		return 2;
 	}
 
 	ret = prg_fd = socket(AF_UNIX, SOCK_STREAM, 0);
@@ -1453,25 +1495,26 @@ out:
 		if (sock_path[0])
 			unlink(sock_path);
 	}
-	close(fdmnt);
+	close_file_or_dir(fdmnt, dirstream);
 
 	if (err)
 		return 1;
 	if (e_correctable)
-		return 7;
+		return 3;
 	if (e_uncorrectable)
-		return 8;
+		return 4;
 	return 0;
 }
 
 static const char * const cmd_scrub_start_usage[] = {
-	"btrfs scrub start [-Bdqr] [-c ioprio_class -n ioprio_classdata] <path>|<device>",
+	"btrfs scrub start [-BdqrR] [-c ioprio_class -n ioprio_classdata] <path>|<device>",
 	"Start a new scrub",
 	"",
 	"-B     do not background",
 	"-d     stats per device (-B only)",
 	"-q     be quiet",
 	"-r     read only mode",
+	"-R     raw print mode, print full data instead of summary"
 	"-c     set ioprio class (see ionice(1) manpage)",
 	"-n     set ioprio classdata (see ionice(1) manpage)",
 	NULL
@@ -1493,13 +1536,14 @@ static int cmd_scrub_cancel(int argc, char **argv)
 	char *path;
 	int ret;
 	int fdmnt = -1;
+	DIR *dirstream = NULL;
 
 	if (check_argc_exact(argc, 2))
 		usage(cmd_scrub_cancel_usage);
 
 	path = argv[1];
 
-	fdmnt = open_path_or_dev_mnt(path);
+	fdmnt = open_path_or_dev_mnt(path, &dirstream);
 	if (fdmnt < 0) {
 		fprintf(stderr, "ERROR: could not open %s: %s\n",
 			path, strerror(errno));
@@ -1512,7 +1556,10 @@ static int cmd_scrub_cancel(int argc, char **argv)
 	if (ret < 0) {
 		fprintf(stderr, "ERROR: scrub cancel failed on %s: %s\n", path,
 			errno == ENOTCONN ? "not running" : strerror(errno));
-		ret = 1;
+		if (errno == ENOTCONN)
+			ret = 2;
+		else
+			ret = 1;
 		goto out;
 	}
 
@@ -1520,13 +1567,12 @@ static int cmd_scrub_cancel(int argc, char **argv)
 	printf("scrub cancelled\n");
 
 out:
-	if (fdmnt != -1)
-		close(fdmnt);
+	close_file_or_dir(fdmnt, dirstream);
 	return ret;
 }
 
 static const char * const cmd_scrub_resume_usage[] = {
-	"btrfs scrub resume [-Bdqr] [-c ioprio_class -n ioprio_classdata] <path>|<device>",
+	"btrfs scrub resume [-BdqrR] [-c ioprio_class -n ioprio_classdata] <path>|<device>",
 	"Resume previously canceled or interrupted scrub",
 	"",
 	"-B     do not background",
@@ -1572,6 +1618,7 @@ static int cmd_scrub_status(int argc, char **argv)
 	char fsid[37];
 	int fdres = -1;
 	int err = 0;
+	DIR *dirstream = NULL;
 
 	optind = 1;
 	while ((c = getopt(argc, argv, "dR")) != -1) {
@@ -1593,11 +1640,11 @@ static int cmd_scrub_status(int argc, char **argv)
 
 	path = argv[optind];
 
-	fdmnt = open_path_or_dev_mnt(path);
+	fdmnt = open_path_or_dev_mnt(path, &dirstream);
 
 	if (fdmnt < 0) {
 		fprintf(stderr, "ERROR: can't access to '%s'\n", path);
-		return 12;
+		return 1;
 	}
 
 	ret = get_fs_info(path, &fi_args, &di_args);
@@ -1680,8 +1727,9 @@ out:
 	free(di_args);
 	if (fdres > -1)
 		close(fdres);
+	close_file_or_dir(fdmnt, dirstream);
 
-	return err;
+	return !!err;
 }
 
 const struct cmd_group scrub_cmd_group = {
@@ -1690,7 +1738,7 @@ const struct cmd_group scrub_cmd_group = {
 		{ "cancel", cmd_scrub_cancel, cmd_scrub_cancel_usage, NULL, 0 },
 		{ "resume", cmd_scrub_resume, cmd_scrub_resume_usage, NULL, 0 },
 		{ "status", cmd_scrub_status, cmd_scrub_status_usage, NULL, 0 },
-		{ 0, 0, 0, 0, 0 }
+		NULL_CMD_STRUCT
 	}
 };
 

@@ -325,7 +325,7 @@ static int print_update_extent(const char *path, u64 offset, u64 len,
 	return 0;
 }
 
-struct btrfs_send_ops send_ops_print = {
+static struct btrfs_send_ops send_ops_print = {
 	.subvol = print_subvol,
 	.snapshot = print_snapshot,
 	.mkfile = print_mkfile,
@@ -354,7 +354,7 @@ static void *process_thread(void *arg_)
 	int ret;
 
 	while (1) {
-		ret = btrfs_read_and_process_send_stream(pipefd[-1],
+		ret = btrfs_read_and_process_send_stream(pipefd[0],
 							 &send_ops_print, arg_, 0);
 		if (ret)
 			break;
@@ -454,5 +454,5 @@ int main(int argc, char **argv)
 
 	pthread_attr_destroy(&t_attr);
 out:
-	return ret;
+	return !!ret;
 }

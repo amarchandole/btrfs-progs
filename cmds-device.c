@@ -22,6 +22,7 @@
 #include <sys/ioctl.h>
 #include <errno.h>
 #include <sys/stat.h>
+#include <getopt.h>
 
 #include "kerncompat.h"
 #include "ctree.h"
@@ -30,23 +31,16 @@
 
 #include "commands.h"
 
-/* FIXME - imported cruft, fix sparse errors and warnings */
-#ifdef __CHECKER__
-#define BLKGETSIZE64 0
-#define BTRFS_IOC_SNAP_CREATE_V2 0
-#define BTRFS_VOL_NAME_MAX 255
-struct btrfs_ioctl_vol_args { char name[BTRFS_VOL_NAME_MAX]; };
-static inline int ioctl(int fd, int define, void *arg) { return 0; }
-#endif
-
 static const char * const device_cmd_group_usage[] = {
 	"btrfs device <command> [<args>]",
 	NULL
 };
 
 static const char * const cmd_add_dev_usage[] = {
-	"btrfs device add <device> [<device>...] <path>",
+	"btrfs device add [options] <device> [<device>...] <path>",
 	"Add a device to a filesystem",
+	"-K|--nodiscard    do not perform whole device TRIM",
+	"-f|--force        force overwrite existing filesystem on the disk",
 	NULL
 };
 
@@ -54,34 +48,56 @@ static int cmd_add_dev(int argc, char **argv)
 {
 	char	*mntpnt;
 	int	i, fdmnt, ret=0, e;
+	DIR	*dirstream = NULL;
+	int discard = 1;
+	int force = 0;
+	char estr[100];
 
-	if (check_argc_min(argc, 3))
-		usage(cmd_add_dev_usage);
-
-	mntpnt = argv[argc - 1];
-
-	fdmnt = open_file_or_dir(mntpnt);
-	if (fdmnt < 0) {
-		fprintf(stderr, "ERROR: can't access to '%s'\n", mntpnt);
-		return 12;
+	while (1) {
+		int long_index;
+		static struct option long_options[] = {
+			{ "nodiscard", optional_argument, NULL, 'K'},
+			{ "force", no_argument, NULL, 'f'},
+			{ 0, 0, 0, 0 }
+		};
+		int c = getopt_long(argc, argv, "Kf", long_options,
+					&long_index);
+		if (c < 0)
+			break;
+		switch (c) {
+		case 'K':
+			discard = 0;
+			break;
+		case 'f':
+			force = 1;
+			break;
+		default:
+			usage(cmd_add_dev_usage);
+		}
 	}
 
-	for (i = 1; i < argc - 1; i++ ){
+	argc = argc - optind;
+
+	if (check_argc_min(argc, 2))
+		usage(cmd_add_dev_usage);
+
+	mntpnt = argv[optind + argc - 1];
+
+	fdmnt = open_file_or_dir(mntpnt, &dirstream);
+	if (fdmnt < 0) {
+		fprintf(stderr, "ERROR: can't access to '%s'\n", mntpnt);
+		return 1;
+	}
+
+	for (i = optind; i < optind + argc - 1; i++){
 		struct btrfs_ioctl_vol_args ioctl_args;
 		int	devfd, res;
 		u64 dev_block_count = 0;
-		struct stat st;
 		int mixed = 0;
 
-		res = check_mounted(argv[i]);
-		if (res < 0) {
-			fprintf(stderr, "error checking %s mount status\n",
-				argv[i]);
-			ret++;
-			continue;
-		}
-		if (res == 1) {
-			fprintf(stderr, "%s is mounted\n", argv[i]);
+		res = test_dev_for_mkfs(argv[i], force, estr);
+		if (res) {
+			fprintf(stderr, "%s", estr);
 			ret++;
 			continue;
 		}
@@ -92,22 +108,9 @@ static int cmd_add_dev(int argc, char **argv)
 			ret++;
 			continue;
 		}
-		res = fstat(devfd, &st);
-		if (res) {
-			fprintf(stderr, "ERROR: Unable to stat '%s'\n", argv[i]);
-			close(devfd);
-			ret++;
-			continue;
-		}
-		if (!S_ISBLK(st.st_mode)) {
-			fprintf(stderr, "ERROR: '%s' is not a block device\n", argv[i]);
-			close(devfd);
-			ret++;
-			continue;
-		}
 
 		res = btrfs_prepare_device(devfd, argv[i], 1, &dev_block_count,
-					   0, &mixed, 0);
+					   0, &mixed, discard);
 		if (res) {
 			fprintf(stderr, "ERROR: Unable to init '%s'\n", argv[i]);
 			close(devfd);
@@ -127,11 +130,8 @@ static int cmd_add_dev(int argc, char **argv)
 
 	}
 
-	close(fdmnt);
-	if (ret)
-		return ret+20;
-	else
-		return 0;
+	close_file_or_dir(fdmnt, dirstream);
+	return !!ret;
 }
 
 static const char * const cmd_rm_dev_usage[] = {
@@ -144,16 +144,17 @@ static int cmd_rm_dev(int argc, char **argv)
 {
 	char	*mntpnt;
 	int	i, fdmnt, ret=0, e;
+	DIR	*dirstream = NULL;
 
 	if (check_argc_min(argc, 3))
 		usage(cmd_rm_dev_usage);
 
 	mntpnt = argv[argc - 1];
 
-	fdmnt = open_file_or_dir(mntpnt);
+	fdmnt = open_file_or_dir(mntpnt, &dirstream);
 	if (fdmnt < 0) {
 		fprintf(stderr, "ERROR: can't access to '%s'\n", mntpnt);
-		return 12;
+		return 1;
 	}
 
 	for(i=1 ; i < argc - 1; i++ ){
@@ -163,22 +164,25 @@ static int cmd_rm_dev(int argc, char **argv)
 		strncpy_null(arg.name, argv[i]);
 		res = ioctl(fdmnt, BTRFS_IOC_RM_DEV, &arg);
 		e = errno;
-		if(res<0){
-			fprintf(stderr, "ERROR: error removing the device '%s' - %s\n",
+		if (res > 0) {
+			fprintf(stderr,
+				"ERROR: error removing the device '%s' - %s\n",
+				argv[i], btrfs_err_str(res));
+			ret++;
+		} else if (res < 0) {
+			fprintf(stderr,
+				"ERROR: error removing the device '%s' - %s\n",
 				argv[i], strerror(e));
 			ret++;
 		}
 	}
 
-	close(fdmnt);
-	if( ret)
-		return ret+20;
-	else
-		return 0;
+	close_file_or_dir(fdmnt, dirstream);
+	return !!ret;
 }
 
 static const char * const cmd_scan_dev_usage[] = {
-	"btrfs device scan [<device>...]",
+	"btrfs device scan [<--all-devices>|<device> [<device>...]]",
 	"Scan devices for a btrfs filesystem",
 	NULL
 };
@@ -186,29 +190,24 @@ static const char * const cmd_scan_dev_usage[] = {
 static int cmd_scan_dev(int argc, char **argv)
 {
 	int	i, fd, e;
-	int	checklist = 1;
+	int	where = BTRFS_SCAN_LBLKID;
 	int	devstart = 1;
 
 	if( argc > 1 && !strcmp(argv[1],"--all-devices")){
 		if (check_argc_max(argc, 2))
 			usage(cmd_scan_dev_usage);
 
-		checklist = 0;
+		where = BTRFS_SCAN_DEV;
 		devstart += 1;
 	}
 
 	if(argc<=devstart){
-
 		int ret;
-
 		printf("Scanning for Btrfs filesystems\n");
-		if(checklist)
-			ret = btrfs_scan_block_devices(1);
-		else
-			ret = btrfs_scan_one_dir("/dev", 1);
+		ret = scan_for_btrfs(where, BTRFS_UPDATE_KERNEL);
 		if (ret){
 			fprintf(stderr, "ERROR: error %d while scanning\n", ret);
-			return 18;
+			return 1;
 		}
 		return 0;
 	}
@@ -216,7 +215,7 @@ static int cmd_scan_dev(int argc, char **argv)
 	fd = open("/dev/btrfs-control", O_RDWR);
 	if (fd < 0) {
 		perror("failed to open /dev/btrfs-control");
-		return 10;
+		return 1;
 	}
 
 	for( i = devstart ; i < argc ; i++ ){
@@ -238,7 +237,7 @@ static int cmd_scan_dev(int argc, char **argv)
 			close(fd);
 			fprintf(stderr, "ERROR: unable to scan the device '%s' - %s\n",
 				argv[i], strerror(e));
-			return 11;
+			return 1;
 		}
 	}
 
@@ -264,7 +263,7 @@ static int cmd_ready_dev(int argc, char **argv)
 	fd = open("/dev/btrfs-control", O_RDWR);
 	if (fd < 0) {
 		perror("failed to open /dev/btrfs-control");
-		return 10;
+		return 1;
 	}
 
 	strncpy(args.name, argv[argc - 1], BTRFS_PATH_NAME_MAX);
@@ -288,15 +287,16 @@ static const char * const cmd_dev_stats_usage[] = {
 
 static int cmd_dev_stats(int argc, char **argv)
 {
-	char *path;
+	char *dev_path;
 	struct btrfs_ioctl_fs_info_args fi_args;
 	struct btrfs_ioctl_dev_info_args *di_args = NULL;
 	int ret;
 	int fdmnt;
 	int i;
-	char c;
+	int c;
 	int err = 0;
 	__u64 flags = 0;
+	DIR *dirstream = NULL;
 
 	optind = 1;
 	while ((c = getopt(argc, argv, "z")) != -1) {
@@ -319,16 +319,16 @@ static int cmd_dev_stats(int argc, char **argv)
 		return 1;
 	}
 
-	path = argv[optind];
+	dev_path = argv[optind];
 
-	fdmnt = open_path_or_dev_mnt(path);
+	fdmnt = open_path_or_dev_mnt(dev_path, &dirstream);
 
 	if (fdmnt < 0) {
-		fprintf(stderr, "ERROR: can't access '%s'\n", path);
-		return 12;
+		fprintf(stderr, "ERROR: can't access '%s'\n", dev_path);
+		return 1;
 	}
 
-	ret = get_fs_info(path, &fi_args, &di_args);
+	ret = get_fs_info(dev_path, &fi_args, &di_args);
 	if (ret) {
 		fprintf(stderr, "ERROR: getting dev info for devstats failed: "
 				"%s\n", strerror(-ret));
@@ -389,7 +389,7 @@ static int cmd_dev_stats(int argc, char **argv)
 
 out:
 	free(di_args);
-	close(fdmnt);
+	close_file_or_dir(fdmnt, dirstream);
 
 	return err;
 }
@@ -401,7 +401,7 @@ const struct cmd_group device_cmd_group = {
 		{ "scan", cmd_scan_dev, cmd_scan_dev_usage, NULL, 0 },
 		{ "ready", cmd_ready_dev, cmd_ready_dev_usage, NULL, 0 },
 		{ "stats", cmd_dev_stats, cmd_dev_stats_usage, NULL, 0 },
-		{ 0, 0, 0, 0, 0 }
+		NULL_CMD_STRUCT
 	}
 };
 

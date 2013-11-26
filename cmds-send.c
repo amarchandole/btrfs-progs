@@ -31,6 +31,7 @@
 #include <sys/ioctl.h>
 #include <libgen.h>
 #include <mntent.h>
+#include <assert.h>
 
 #include <uuid/uuid.h>
 
@@ -62,6 +63,7 @@ int find_mount_root(const char *path, char **mount_root)
 	int fd;
 	struct mntent *ent;
 	int len;
+	int ret;
 	int longest_matchlen = 0;
 	char *longest_match = NULL;
 
@@ -71,6 +73,9 @@ int find_mount_root(const char *path, char **mount_root)
 	close(fd);
 
 	mnttab = fopen("/proc/mounts", "r");
+	if (!mnttab)
+		return -errno;
+
 	while ((ent = getmntent(mnttab))) {
 		len = strlen(ent->mnt_dir);
 		if (strncmp(ent->mnt_dir, path, len) == 0) {
@@ -91,10 +96,13 @@ int find_mount_root(const char *path, char **mount_root)
 		return -ENOENT;
 	}
 
+	ret = 0;
 	*mount_root = realpath(longest_match, NULL);
-	free(longest_match);
+	if (!*mount_root)
+		ret = -errno;
 
-	return 0;
+	free(longest_match);
+	return ret;
 }
 
 static int get_root_id(struct btrfs_send *s, const char *path, u64 *root_id)
@@ -106,30 +114,33 @@ static int get_root_id(struct btrfs_send *s, const char *path, u64 *root_id)
 	if (!si)
 		return -ENOENT;
 	*root_id = si->root_id;
+	free(si->path);
+	free(si);
 	return 0;
 }
 
 static struct subvol_info *get_parent(struct btrfs_send *s, u64 root_id)
 {
+	struct subvol_info *si_tmp;
 	struct subvol_info *si;
 
-	si = subvol_uuid_search(&s->sus, root_id, NULL, 0, NULL,
+	si_tmp = subvol_uuid_search(&s->sus, root_id, NULL, 0, NULL,
 			subvol_search_by_root_id);
-	if (!si)
+	if (!si_tmp)
 		return NULL;
 
-	si = subvol_uuid_search(&s->sus, 0, si->parent_uuid, 0, NULL,
+	si = subvol_uuid_search(&s->sus, 0, si_tmp->parent_uuid, 0, NULL,
 			subvol_search_by_uuid);
-	if (!si)
-		return NULL;
+	free(si_tmp->path);
+	free(si_tmp);
 	return si;
 }
 
 static int find_good_parent(struct btrfs_send *s, u64 root_id, u64 *found)
 {
 	int ret;
-	struct subvol_info *parent;
-	struct subvol_info *parent2;
+	struct subvol_info *parent = NULL;
+	struct subvol_info *parent2 = NULL;
 	struct subvol_info *best_parent = NULL;
 	__s64 tmp;
 	u64 best_diff = (u64)-1;
@@ -144,24 +155,43 @@ static int find_good_parent(struct btrfs_send *s, u64 root_id, u64 *found)
 	for (i = 0; i < s->clone_sources_count; i++) {
 		if (s->clone_sources[i] == parent->root_id) {
 			best_parent = parent;
+			parent = NULL;
 			goto out_found;
 		}
 	}
 
 	for (i = 0; i < s->clone_sources_count; i++) {
 		parent2 = get_parent(s, s->clone_sources[i]);
-		if (parent2 != parent)
+		if (!parent2)
 			continue;
+		if (parent2->root_id != parent->root_id) {
+			free(parent2->path);
+			free(parent2);
+			parent2 = NULL;
+			continue;
+		}
 
+		free(parent2->path);
+		free(parent2);
 		parent2 = subvol_uuid_search(&s->sus, s->clone_sources[i], NULL,
 				0, NULL, subvol_search_by_root_id);
 
+		assert(parent2);
 		tmp = parent2->ctransid - parent->ctransid;
 		if (tmp < 0)
 			tmp *= -1;
 		if (tmp < best_diff) {
+			if (best_parent) {
+				free(best_parent->path);
+				free(best_parent);
+			}
 			best_parent = parent2;
+			parent2 = NULL;
 			best_diff = tmp;
+		} else {
+			free(parent2->path);
+			free(parent2);
+			parent2 = NULL;
 		}
 	}
 
@@ -175,6 +205,14 @@ out_found:
 	ret = 0;
 
 out:
+	if (parent) {
+		free(parent->path);
+		free(parent);
+	}
+	if (best_parent) {
+		free(best_parent->path);
+		free(best_parent);
+	}
 	return ret;
 }
 
@@ -244,7 +282,8 @@ out:
 	return ERR_PTR(ret);
 }
 
-static int do_send(struct btrfs_send *send, u64 root_id, u64 parent_root_id)
+static int do_send(struct btrfs_send *send, u64 root_id, u64 parent_root_id,
+		   int is_first_subvol, int is_last_subvol)
 {
 	int ret;
 	pthread_t t_read;
@@ -298,11 +337,18 @@ static int do_send(struct btrfs_send *send, u64 root_id, u64 parent_root_id)
 	io_send.clone_sources = (__u64*)send->clone_sources;
 	io_send.clone_sources_count = send->clone_sources_count;
 	io_send.parent_root = parent_root_id;
+	if (!is_first_subvol)
+		io_send.flags |= BTRFS_SEND_FLAG_OMIT_STREAM_HEADER;
+	if (!is_last_subvol)
+		io_send.flags |= BTRFS_SEND_FLAG_OMIT_END_CMD;
 	ret = ioctl(subvol_fd, BTRFS_IOC_SEND, &io_send);
 	if (ret) {
 		ret = -errno;
 		fprintf(stderr, "ERROR: send ioctl failed with %d: %s\n", ret,
 			strerror(-ret));
+		if (ret == -EINVAL && (!is_first_subvol || !is_last_subvol))
+			fprintf(stderr,
+				"Try upgrading your kernel or don't use -e.\n");
 		goto out;
 	}
 	if (g_verbose > 0)
@@ -312,7 +358,7 @@ static int do_send(struct btrfs_send *send, u64 root_id, u64 parent_root_id)
 		fprintf(stderr, "joining genl thread\n");
 
 	close(pipefd[1]);
-	pipefd[1] = 0;
+	pipefd[1] = -1;
 
 	ret = pthread_join(t_read, &t_err);
 	if (ret) {
@@ -339,6 +385,10 @@ out:
 		close(pipefd[0]);
 	if (pipefd[1] != -1)
 		close(pipefd[1]);
+	if (si) {
+		free(si->path);
+		free(si);
+	}
 	return ret;
 }
 
@@ -422,7 +472,7 @@ out:
 	return ret;
 }
 
-int cmd_send_start(int argc, char **argv)
+int cmd_send(int argc, char **argv)
 {
 	char *subvol = NULL;
 	int c;
@@ -435,14 +485,18 @@ int cmd_send_start(int argc, char **argv)
 	u64 root_id;
 	u64 parent_root_id = 0;
 	int full_send = 1;
+	int new_end_cmd_semantic = 0;
 
 	memset(&send, 0, sizeof(send));
 	send.dump_fd = fileno(stdout);
 
-	while ((c = getopt(argc, argv, "vc:f:i:p:")) != -1) {
+	while ((c = getopt(argc, argv, "vec:f:i:p:")) != -1) {
 		switch (c) {
 		case 'v':
 			g_verbose++;
+			break;
+		case 'e':
+			new_end_cmd_semantic = 1;
 			break;
 		case 'c':
 			subvol = realpath(optarg, NULL);
@@ -594,6 +648,9 @@ int cmd_send_start(int argc, char **argv)
 	}
 
 	for (i = optind; i < argc; i++) {
+		int is_first_subvol;
+		int is_last_subvol;
+
 		free(subvol);
 		subvol = argv[i];
 
@@ -634,7 +691,17 @@ int cmd_send_start(int argc, char **argv)
 			goto out;
 		}
 
-		ret = do_send(&send, root_id, parent_root_id);
+		if (new_end_cmd_semantic) {
+			/* require new kernel */
+			is_first_subvol = (i == optind);
+			is_last_subvol = (i == argc - 1);
+		} else {
+			/* be compatible to old and new kernel */
+			is_first_subvol = 1;
+			is_last_subvol = 1;
+		}
+		ret = do_send(&send, root_id, parent_root_id,
+			      is_first_subvol, is_last_subvol);
 		if (ret < 0)
 			goto out;
 
@@ -655,21 +722,16 @@ out:
 		close(send.mnt_fd);
 	free(send.root_path);
 	subvol_uuid_search_finit(&send.sus);
-	return ret;
+	return !!ret;
 }
 
-static const char * const send_cmd_group_usage[] = {
-	"btrfs send <command> <args>",
-	NULL
-};
-
 const char * const cmd_send_usage[] = {
-	"btrfs send [-v] [-p <parent>] [-c <clone-src>] <subvol>",
+	"btrfs send [-ve] [-p <parent>] [-c <clone-src>] [-f <outfile>] <subvol>",
 	"Send the subvolume to stdout.",
 	"Sends the subvolume specified by <subvol> to stdout.",
 	"By default, this will send the whole subvolume. To do an incremental",
 	"send, use '-p <parent>'. If you want to allow btrfs to clone from",
-	"any additional local snapshots, use -c <clone-src> (multiple times",
+	"any additional local snapshots, use '-c <clone-src>' (multiple times",
 	"where applicable). You must not specify clone sources unless you",
 	"guarantee that these snapshots are exactly in the same state on both",
 	"sides, the sender and the receiver. It is allowed to omit the",
@@ -679,6 +741,8 @@ const char * const cmd_send_usage[] = {
 	"\n",
 	"-v               Enable verbose debug output. Each occurrence of",
 	"                 this option increases the verbose level more.",
+	"-e               If sending multiple subvols at once, use the new",
+	"                 format and omit the end-cmd between the subvols.",
 	"-p <parent>      Send an incremental stream from <parent> to",
 	"                 <subvol>.",
 	"-c <clone-src>   Use this snapshot as a clone source for an ",
@@ -688,8 +752,3 @@ const char * const cmd_send_usage[] = {
 	"                 use pipes.",
 	NULL
 };
-
-int cmd_send(int argc, char **argv)
-{
-	return cmd_send_start(argc, argv);
-}

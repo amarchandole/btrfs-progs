@@ -31,7 +31,7 @@ static const char * const btrfs_cmd_group_usage[] = {
 static const char btrfs_cmd_group_info[] =
 	"Use --help as an argument for information on a specific group or command.";
 
-char argv0_buf[ARGV0_BUF_SIZE] = "btrfs";
+static char argv0_buf[ARGV0_BUF_SIZE] = "btrfs";
 
 static inline const char *skip_prefix(const char *str, const char *prefix)
 {
@@ -106,8 +106,8 @@ parse_command_token(const char *arg, const struct cmd_group *grp)
 	return cmd;
 }
 
-void handle_help_options_next_level(const struct cmd_struct *cmd,
-				    int argc, char **argv)
+static void handle_help_options_next_level(const struct cmd_struct *cmd,
+		int argc, char **argv)
 {
 	if (argc < 2)
 		return;
@@ -184,11 +184,11 @@ int check_argc_max(int nargs, int expected)
 	return 0;
 }
 
-const struct cmd_group btrfs_cmd_group;
+static const struct cmd_group btrfs_cmd_group;
 
 static const char * const cmd_help_usage[] = {
 	"btrfs help [--full]",
-	"Dislay help information",
+	"Display help information",
 	"",
 	"--full     display detailed help on every command",
 	NULL
@@ -239,7 +239,7 @@ static int handle_options(int *argc, char ***argv)
 	return (*argv) - orig_argv;
 }
 
-const struct cmd_group btrfs_cmd_group = {
+static const struct cmd_group btrfs_cmd_group = {
 	btrfs_cmd_group_usage, btrfs_cmd_group_info, {
 		{ "subvolume", cmd_subvolume, NULL, &subvolume_cmd_group, 0 },
 		{ "filesystem", cmd_filesystem, NULL, &filesystem_cmd_group, 0 },
@@ -247,6 +247,7 @@ const struct cmd_group btrfs_cmd_group = {
 		{ "device", cmd_device, NULL, &device_cmd_group, 0 },
 		{ "scrub", cmd_scrub, NULL, &scrub_cmd_group, 0 },
 		{ "check", cmd_check, cmd_check_usage, NULL, 0 },
+		{ "rescue", cmd_rescue, NULL, &rescue_cmd_group, 0 },
 		{ "restore", cmd_restore, cmd_restore_usage, NULL, 0 },
 		{ "inspect-internal", cmd_inspect, NULL, &inspect_cmd_group, 0 },
 		{ "send", cmd_send, cmd_send_usage, NULL, 0 },
@@ -256,7 +257,7 @@ const struct cmd_group btrfs_cmd_group = {
 		{ "replace", cmd_replace, NULL, &replace_cmd_group, 0 },
 		{ "help", cmd_help, cmd_help_usage, NULL, 0 },
 		{ "version", cmd_version, cmd_version_usage, NULL, 0 },
-		{ 0, 0, 0, 0, 0 }
+		NULL_CMD_STRUCT
 	},
 };
 

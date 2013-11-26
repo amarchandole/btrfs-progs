@@ -39,6 +39,7 @@ static int qgroup_assign(int assign, int argc, char **argv)
 	int e;
 	char *path = argv[3];
 	struct btrfs_ioctl_qgroup_assign_args args;
+	DIR *dirstream = NULL;
 
 	if (check_argc_exact(argc, 4))
 		return -1;
@@ -53,21 +54,21 @@ static int qgroup_assign(int assign, int argc, char **argv)
 	 */
 	if ((args.src >> 48) >= (args.dst >> 48)) {
 		fprintf(stderr, "ERROR: bad relation requested '%s'\n", path);
-		return 12;
+		return 1;
 	}
-	fd = open_file_or_dir(path);
+	fd = open_file_or_dir(path, &dirstream);
 	if (fd < 0) {
 		fprintf(stderr, "ERROR: can't access '%s'\n", path);
-		return 12;
+		return 1;
 	}
 
 	ret = ioctl(fd, BTRFS_IOC_QGROUP_ASSIGN, &args);
 	e = errno;
-	close(fd);
+	close_file_or_dir(fd, dirstream);
 	if (ret < 0) {
 		fprintf(stderr, "ERROR: unable to assign quota group: %s\n",
 			strerror(e));
-		return 30;
+		return 1;
 	}
 	return 0;
 }
@@ -79,6 +80,7 @@ static int qgroup_create(int create, int argc, char **argv)
 	int e;
 	char *path = argv[2];
 	struct btrfs_ioctl_qgroup_create_args args;
+	DIR *dirstream = NULL;
 
 	if (check_argc_exact(argc, 3))
 		return -1;
@@ -87,110 +89,21 @@ static int qgroup_create(int create, int argc, char **argv)
 	args.create = create;
 	args.qgroupid = parse_qgroupid(argv[1]);
 
-	fd = open_file_or_dir(path);
+	fd = open_file_or_dir(path, &dirstream);
 	if (fd < 0) {
 		fprintf(stderr, "ERROR: can't access '%s'\n", path);
-		return 12;
+		return 1;
 	}
 
 	ret = ioctl(fd, BTRFS_IOC_QGROUP_CREATE, &args);
 	e = errno;
-	close(fd);
+	close_file_or_dir(fd, dirstream);
 	if (ret < 0) {
 		fprintf(stderr, "ERROR: unable to create quota group: %s\n",
 			strerror(e));
-		return 30;
+		return 1;
 	}
 	return 0;
-}
-
-void print_qgroup_info(u64 objectid, struct btrfs_qgroup_info_item *info)
-{
-	printf("%llu/%llu %lld %lld\n", objectid >> 48,
-		objectid & ((1ll << 48) - 1),
-		btrfs_stack_qgroup_info_referenced(info),
-		btrfs_stack_qgroup_info_exclusive(info));
-}
-
-int list_qgroups(int fd)
-{
-	int ret;
-	struct btrfs_ioctl_search_args args;
-	struct btrfs_ioctl_search_key *sk = &args.key;
-	struct btrfs_ioctl_search_header *sh;
-	unsigned long off = 0;
-	unsigned int i;
-	struct btrfs_qgroup_info_item *info;
-
-	memset(&args, 0, sizeof(args));
-
-	/* search in the quota tree */
-	sk->tree_id = BTRFS_QUOTA_TREE_OBJECTID;
-
-	/*
-	 * set the min and max to backref keys.  The search will
-	 * only send back this type of key now.
-	 */
-	sk->max_type = BTRFS_QGROUP_INFO_KEY;
-	sk->min_type = BTRFS_QGROUP_INFO_KEY;
-	sk->max_objectid = 0;
-	sk->max_offset = (u64)-1;
-	sk->max_transid = (u64)-1;
-
-	/* just a big number, doesn't matter much */
-	sk->nr_items = 4096;
-
-	while (1) {
-		ret = ioctl(fd, BTRFS_IOC_TREE_SEARCH, &args);
-		if (ret < 0)
-			return ret;
-
-		/* the ioctl returns the number of item it found in nr_items */
-		if (sk->nr_items == 0)
-			break;
-
-		off = 0;
-
-		/*
-		 * for each item, pull the key out of the header and then
-		 * read the root_ref item it contains
-		 */
-		for (i = 0; i < sk->nr_items; i++) {
-			sh = (struct btrfs_ioctl_search_header *)(args.buf +
-								  off);
-			off += sizeof(*sh);
-
-			if (sh->objectid != 0)
-				goto done;
-
-			if (sh->type != BTRFS_QGROUP_INFO_KEY)
-				goto done;
-
-			info = (struct btrfs_qgroup_info_item *)
-					(args.buf + off);
-			print_qgroup_info(sh->offset, info);
-
-			off += sh->len;
-
-			/*
-			 * record the mins in sk so we can make sure the
-			 * next search doesn't repeat this root
-			 */
-			sk->min_offset = sh->offset;
-		}
-		sk->nr_items = 4096;
-		/*
-		 * this iteration is done, step forward one qgroup for the next
-		 * ioctl
-		 */
-		if (sk->min_offset < (u64)-1)
-			sk->min_offset++;
-		else
-			break;
-	}
-
-done:
-	return ret;
 }
 
 static int parse_limit(const char *p, unsigned long long *s)
@@ -207,12 +120,15 @@ static int parse_limit(const char *p, unsigned long long *s)
 	case 'T':
 	case 't':
 		size *= 1024;
+		/* fallthrough */
 	case 'G':
 	case 'g':
 		size *= 1024;
+		/* fallthrough */
 	case 'M':
 	case 'm':
 		size *= 1024;
+		/* fallthrough */
 	case 'K':
 	case 'k':
 		size *= 1024;
@@ -289,37 +205,113 @@ static int cmd_qgroup_destroy(int argc, char **argv)
 }
 
 static const char * const cmd_qgroup_show_usage[] = {
-	"btrfs qgroup show <path>",
-	"Show all subvolume quota groups.",
+	"btrfs qgroup show -pcreFf "
+	"[--sort=qgroupid,rfer,excl,max_rfer,max_excl] <path>",
+	"Show subvolume quota groups.",
+	"-p		print parent qgroup id",
+	"-c		print child qgroup id",
+	"-r		print max referenced size of qgroup",
+	"-e		print max exclusive size of qgroup",
+	"-F		list all qgroups which impact the given path"
+	"(include ancestral qgroups)",
+	"-f		list all qgroups which impact the given path"
+	"(exclude ancestral qgroups)",
+	"--sort=qgroupid,rfer,excl,max_rfer,max_excl",
+	"		list qgroups in order of qgroupid,"
+	"rfer,max_rfer or max_excl",
+	"		you can use '+' or '-' in front of each item.",
+	"		(+:ascending, -:descending, ascending default)",
 	NULL
 };
 
 static int cmd_qgroup_show(int argc, char **argv)
 {
+	char *path;
 	int ret = 0;
 	int fd;
 	int e;
-	char *path = argv[1];
+	DIR *dirstream = NULL;
+	int c;
+	u64 qgroupid;
+	int filter_flag = 0;
 
-	if (check_argc_exact(argc, 2))
+	struct btrfs_qgroup_comparer_set *comparer_set;
+	struct btrfs_qgroup_filter_set *filter_set;
+	filter_set = btrfs_qgroup_alloc_filter_set();
+	comparer_set = btrfs_qgroup_alloc_comparer_set();
+	struct option long_options[] = {
+		{"sort", 1, NULL, 'S'},
+		{0, 0, 0, 0}
+	};
+
+	optind = 1;
+	while (1) {
+		c = getopt_long(argc, argv, "pcreFf",
+				long_options, NULL);
+		if (c < 0)
+			break;
+		switch (c) {
+		case 'p':
+			btrfs_qgroup_setup_print_column(
+				BTRFS_QGROUP_PARENT);
+			break;
+		case 'c':
+			btrfs_qgroup_setup_print_column(
+				BTRFS_QGROUP_CHILD);
+			break;
+		case 'r':
+			btrfs_qgroup_setup_print_column(
+				BTRFS_QGROUP_MAX_RFER);
+			break;
+		case 'e':
+			btrfs_qgroup_setup_print_column(
+				BTRFS_QGROUP_MAX_EXCL);
+			break;
+		case 'F':
+			filter_flag |= 0x1;
+			break;
+		case 'f':
+			filter_flag |= 0x2;
+			break;
+		case 'S':
+			ret = btrfs_qgroup_parse_sort_string(optarg,
+							     &comparer_set);
+			if (ret)
+				usage(cmd_qgroup_show_usage);
+			break;
+		default:
+			usage(cmd_qgroup_show_usage);
+		}
+	}
+	if (check_argc_exact(argc - optind, 1))
 		usage(cmd_qgroup_show_usage);
 
-	fd = open_file_or_dir(path);
+	path = argv[optind];
+	fd = open_file_or_dir(path, &dirstream);
 	if (fd < 0) {
 		fprintf(stderr, "ERROR: can't access '%s'\n", path);
-		return 12;
+		return 1;
 	}
 
-	ret = list_qgroups(fd);
+	if (filter_flag) {
+		qgroupid = btrfs_get_path_rootid(fd);
+		if (filter_flag & 0x1)
+			btrfs_qgroup_setup_filter(&filter_set,
+					BTRFS_QGROUP_FILTER_ALL_PARENT,
+					qgroupid);
+		if (filter_flag & 0x2)
+			btrfs_qgroup_setup_filter(&filter_set,
+					BTRFS_QGROUP_FILTER_PARENT,
+					qgroupid);
+	}
+	ret = btrfs_show_qgroups(fd, filter_set, comparer_set);
 	e = errno;
-	close(fd);
-	if (ret < 0) {
+	close_file_or_dir(fd, dirstream);
+	if (ret < 0)
 		fprintf(stderr, "ERROR: can't list qgroups: %s\n",
 				strerror(e));
-		return 30;
-	}
 
-	return ret;
+	return !!ret;
 }
 
 static const char * const cmd_qgroup_limit_usage[] = {
@@ -342,6 +334,7 @@ static int cmd_qgroup_limit(int argc, char **argv)
 	unsigned long long size;
 	int compressed = 0;
 	int exclusive = 0;
+	DIR *dirstream = NULL;
 
 	optind = 1;
 	while (1) {
@@ -388,12 +381,12 @@ static int cmd_qgroup_limit(int argc, char **argv)
 		ret = test_issubvolume(path);
 		if (ret < 0) {
 			fprintf(stderr, "ERROR: error accessing '%s'\n", path);
-			return 12;
+			return 1;
 		}
 		if (!ret) {
 			fprintf(stderr, "ERROR: '%s' is not a subvolume\n",
 				path);
-			return 13;
+			return 1;
 		}
 		/*
 		 * keep qgroupid at 0, this indicates that the subvolume the
@@ -405,33 +398,38 @@ static int cmd_qgroup_limit(int argc, char **argv)
 	} else
 		usage(cmd_qgroup_limit_usage);
 
-	fd = open_file_or_dir(path);
+	fd = open_file_or_dir(path, &dirstream);
 	if (fd < 0) {
 		fprintf(stderr, "ERROR: can't access '%s'\n", path);
-		return 12;
+		return 1;
 	}
 
 	ret = ioctl(fd, BTRFS_IOC_QGROUP_LIMIT, &args);
 	e = errno;
-	close(fd);
+	close_file_or_dir(fd, dirstream);
 	if (ret < 0) {
 		fprintf(stderr, "ERROR: unable to limit requested quota group: "
 			"%s\n", strerror(e));
-		return 30;
+		return 1;
 	}
 	return 0;
 }
 
 const struct cmd_group qgroup_cmd_group = {
 	qgroup_cmd_group_usage, NULL, {
-		{ "assign", cmd_qgroup_assign, cmd_qgroup_assign_usage, 0, 0 },
-		{ "remove", cmd_qgroup_remove, cmd_qgroup_remove_usage, 0, 0 },
-		{ "create", cmd_qgroup_create, cmd_qgroup_create_usage, 0, 0 },
-		{ "destroy", cmd_qgroup_destroy,
-		  cmd_qgroup_destroy_usage, 0, 0 },
-		{ "show", cmd_qgroup_show, cmd_qgroup_show_usage, 0, 0 },
-		{ "limit", cmd_qgroup_limit, cmd_qgroup_limit_usage, 0, 0 },
-		{ 0, 0, 0, 0, 0 }
+		{ "assign", cmd_qgroup_assign, cmd_qgroup_assign_usage,
+		   NULL, 0 },
+		{ "remove", cmd_qgroup_remove, cmd_qgroup_remove_usage,
+		   NULL, 0 },
+		{ "create", cmd_qgroup_create, cmd_qgroup_create_usage,
+		   NULL, 0 },
+		{ "destroy", cmd_qgroup_destroy, cmd_qgroup_destroy_usage,
+		   NULL, 0 },
+		{ "show", cmd_qgroup_show, cmd_qgroup_show_usage,
+		   NULL, 0 },
+		{ "limit", cmd_qgroup_limit, cmd_qgroup_limit_usage,
+		   NULL, 0 },
+		NULL_CMD_STRUCT
 	}
 };
 

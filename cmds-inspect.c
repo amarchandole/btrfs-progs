@@ -44,7 +44,7 @@ static int __ino_to_path_fd(u64 inum, int fd, int verbose, const char *prepend)
 
 	fspath = malloc(4096);
 	if (!fspath)
-		return 1;
+		return -ENOMEM;
 
 	memset(fspath, 0, sizeof(*fspath));
 	ipa.inum = inum;
@@ -78,12 +78,14 @@ static int __ino_to_path_fd(u64 inum, int fd, int verbose, const char *prepend)
 
 out:
 	free(fspath);
-	return ret;
+	return !!ret;
 }
 
 static const char * const cmd_inode_resolve_usage[] = {
 	"btrfs inspect-internal inode-resolve [-v] <inode> <path>",
 	"Get file system paths for the given inode",
+	"",
+	"-v   verbose mode",
 	NULL
 };
 
@@ -92,6 +94,7 @@ static int cmd_inode_resolve(int argc, char **argv)
 	int fd;
 	int verbose = 0;
 	int ret;
+	DIR *dirstream = NULL;
 
 	optind = 1;
 	while (1) {
@@ -111,16 +114,16 @@ static int cmd_inode_resolve(int argc, char **argv)
 	if (check_argc_exact(argc - optind, 2))
 		usage(cmd_inode_resolve_usage);
 
-	fd = open_file_or_dir(argv[optind+1]);
+	fd = open_file_or_dir(argv[optind+1], &dirstream);
 	if (fd < 0) {
 		fprintf(stderr, "ERROR: can't access '%s'\n", argv[optind+1]);
-		return 12;
+		return 1;
 	}
 
 	ret = __ino_to_path_fd(atoll(argv[optind]), fd, verbose,
 			       argv[optind+1]);
-	close(fd);
-	return ret;
+	close_file_or_dir(fd, dirstream);
+	return !!ret;
 
 }
 
@@ -148,6 +151,7 @@ static int cmd_logical_resolve(int argc, char **argv)
 	u64 size = 4096;
 	char full_path[4096];
 	char *path_ptr;
+	DIR *dirstream = NULL;
 
 	optind = 1;
 	while (1) {
@@ -183,7 +187,7 @@ static int cmd_logical_resolve(int argc, char **argv)
 	loi.size = size;
 	loi.inodes = (uintptr_t)inodes;
 
-	fd = open_file_or_dir(argv[optind+1]);
+	fd = open_file_or_dir(argv[optind+1], &dirstream);
 	if (fd < 0) {
 		fprintf(stderr, "ERROR: can't access '%s'\n", argv[optind+1]);
 		ret = 12;
@@ -216,6 +220,7 @@ static int cmd_logical_resolve(int argc, char **argv)
 		u64 root = inodes->val[i+2];
 		int path_fd;
 		char *name;
+		DIR *dirs = NULL;
 
 		if (getpath) {
 			name = btrfs_list_path_for_root(fd, root);
@@ -232,7 +237,7 @@ static int cmd_logical_resolve(int argc, char **argv)
 						name);
 				BUG_ON(ret >= bytes_left);
 				free(name);
-				path_fd = open_file_or_dir(full_path);
+				path_fd = open_file_or_dir(full_path, &dirs);
 				if (path_fd < 0) {
 					fprintf(stderr, "ERROR: can't access "
 						"'%s'\n", full_path);
@@ -241,7 +246,7 @@ static int cmd_logical_resolve(int argc, char **argv)
 			}
 			__ino_to_path_fd(inum, path_fd, verbose, full_path);
 			if (path_fd != fd)
-				close(path_fd);
+				close_file_or_dir(path_fd, dirs);
 		} else {
 			printf("inode %llu offset %llu root %llu\n", inum,
 				offset, root);
@@ -249,10 +254,9 @@ static int cmd_logical_resolve(int argc, char **argv)
 	}
 
 out:
-	if (fd >= 0)
-		close(fd);
+	close_file_or_dir(fd, dirstream);
 	free(inodes);
-	return ret;
+	return !!ret;
 }
 
 static const char * const cmd_subvolid_resolve_usage[] = {
@@ -267,11 +271,12 @@ static int cmd_subvolid_resolve(int argc, char **argv)
 	int fd = -1;
 	u64 subvol_id;
 	char path[BTRFS_PATH_NAME_MAX + 1];
+	DIR *dirstream = NULL;
 
 	if (check_argc_exact(argc, 3))
 		usage(cmd_subvolid_resolve_usage);
 
-	fd = open_file_or_dir(argv[2]);
+	fd = open_file_or_dir(argv[2], &dirstream);
 	if (fd < 0) {
 		fprintf(stderr, "ERROR: can't access '%s'\n", argv[2]);
 		ret = -ENOENT;
@@ -292,9 +297,45 @@ static int cmd_subvolid_resolve(int argc, char **argv)
 	printf("%s\n", path);
 
 out:
-	if (fd >= 0)
-		close(fd);
+	close_file_or_dir(fd, dirstream);
 	return ret ? 1 : 0;
+}
+
+static const char* const cmd_rootid_usage[] = {
+	"btrfs inspect-internal rootid <path>",
+	"Get tree ID of the containing subvolume of path.",
+	NULL
+};
+
+static int cmd_rootid(int argc, char **argv)
+{
+	int ret;
+	int fd = -1;
+	u64 rootid;
+	DIR *dirstream = NULL;
+
+	if (check_argc_exact(argc, 2))
+		usage(cmd_rootid_usage);
+
+	fd = open_file_or_dir(argv[1], &dirstream);
+	if (fd < 0) {
+		fprintf(stderr, "ERROR: can't access '%s'\n", argv[1]);
+		ret = -ENOENT;
+		goto out;
+	}
+
+	ret = lookup_ino_rootid(fd, &rootid);
+	if (ret) {
+		fprintf(stderr, "%s: rootid failed with ret=%d\n",
+			argv[0], ret);
+		goto out;
+	}
+
+	printf("%llu\n", (unsigned long long)rootid);
+out:
+	close_file_or_dir(fd, dirstream);
+
+	return !!ret;
 }
 
 const struct cmd_group inspect_cmd_group = {
@@ -305,7 +346,8 @@ const struct cmd_group inspect_cmd_group = {
 			cmd_logical_resolve_usage, NULL, 0 },
 		{ "subvolid-resolve", cmd_subvolid_resolve,
 			cmd_subvolid_resolve_usage, NULL, 0 },
-		{ 0, 0, 0, 0, 0 }
+		{ "rootid", cmd_rootid, cmd_rootid_usage, NULL, 0 },
+		NULL_CMD_STRUCT
 	}
 };
 

@@ -105,7 +105,7 @@ static int io_ctl_prepare_pages(struct io_ctl *io_ctl, struct btrfs_root *root,
 	if (ret) {
 		printf("Couldn't find file extent item for free space inode"
 		       " %Lu\n", ino);
-		btrfs_release_path(root, path);
+		btrfs_release_path(path);
 		return -EINVAL;
 	}
 
@@ -151,7 +151,7 @@ static int io_ctl_prepare_pages(struct io_ctl *io_ctl, struct btrfs_root *root,
 		path->slots[0]++;
 	}
 
-	btrfs_release_path(root, path);
+	btrfs_release_path(path);
 	return ret;
 }
 
@@ -257,7 +257,7 @@ static int io_ctl_read_bitmap(struct io_ctl *io_ctl,
 }
 
 
-int __load_free_space_cache(struct btrfs_root *root,
+static int __load_free_space_cache(struct btrfs_root *root,
 			    struct btrfs_free_space_ctl *ctl,
 			    struct btrfs_path *path, u64 offset)
 {
@@ -287,7 +287,7 @@ int __load_free_space_cache(struct btrfs_root *root,
 	if (ret < 0) {
 		return 0;
 	} else if (ret > 0) {
-		btrfs_release_path(root, path);
+		btrfs_release_path(path);
 		return 0;
 	}
 
@@ -301,7 +301,7 @@ int __load_free_space_cache(struct btrfs_root *root,
 	generation = btrfs_free_space_generation(leaf, header);
 	btrfs_free_space_key(leaf, header, &disk_key);
 	btrfs_disk_key_to_cpu(&inode_location, &disk_key);
-	btrfs_release_path(root, path);
+	btrfs_release_path(path);
 
 	ret = btrfs_search_slot(NULL, root, &inode_location, path, 0, 0);
 	if (ret) {
@@ -318,12 +318,12 @@ int __load_free_space_cache(struct btrfs_root *root,
 		       (unsigned long long)btrfs_inode_generation(leaf,
 								  inode_item),
 		       (unsigned long long)generation);
-		btrfs_release_path(root, path);
+		btrfs_release_path(path);
 		return 0;
 	}
 
 	inode_size = btrfs_inode_size(leaf, inode_item);
-	btrfs_release_path(root, path);
+	btrfs_release_path(path);
 	if (inode_size == 0)
 		return 0;
 
@@ -792,8 +792,8 @@ void btrfs_remove_free_space_cache(struct btrfs_block_group_cache *block_group)
 	__btrfs_remove_free_space_cache(block_group->free_space_ctl);
 }
 
-int btrfs_add_free_space(struct btrfs_free_space_ctl *ctl, u64 offset,
-			 u64 bytes)
+static int btrfs_add_free_space(struct btrfs_free_space_ctl *ctl, u64 offset,
+				u64 bytes)
 {
 	struct btrfs_free_space *info;
 	int ret = 0;

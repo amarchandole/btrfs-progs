@@ -31,6 +31,7 @@
 #include <math.h>
 #include <ftw.h>
 #include <wait.h>
+#include <assert.h>
 
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -129,14 +130,14 @@ static int finish_subvol(struct btrfs_receive *r)
 		goto out;
 	}
 
-	ret = btrfs_list_get_path_rootid(subvol_fd, &r->cur_subvol->root_id);
-	if (ret < 0)
-		goto out;
-	subvol_uuid_search_add(&r->sus, r->cur_subvol);
-	r->cur_subvol = NULL;
 	ret = 0;
 
 out:
+	if (r->cur_subvol) {
+		free(r->cur_subvol->path);
+		free(r->cur_subvol);
+		r->cur_subvol = NULL;
+	}
 	if (subvol_fd != -1)
 		close(subvol_fd);
 	return ret;
@@ -197,7 +198,7 @@ static int process_snapshot(const char *path, const u8 *uuid, u64 ctransid,
 	struct btrfs_receive *r = user;
 	char uuid_str[128];
 	struct btrfs_ioctl_vol_args_v2 args_v2;
-	struct subvol_info *parent_subvol;
+	struct subvol_info *parent_subvol = NULL;
 
 	ret = finish_subvol(r);
 	if (ret < 0)
@@ -268,6 +269,10 @@ static int process_snapshot(const char *path, const u8 *uuid, u64 ctransid,
 	}
 
 out:
+	if (parent_subvol) {
+		free(parent_subvol->path);
+		free(parent_subvol);
+	}
 	return ret;
 }
 
@@ -557,7 +562,7 @@ static int process_clone(const char *path, u64 offset, u64 len,
 			 const char *clone_path, u64 clone_offset,
 			 void *user)
 {
-	int ret = 0;
+	int ret;
 	struct btrfs_receive *r = user;
 	struct btrfs_ioctl_clone_range_args clone_args;
 	struct subvol_info *si = NULL;
@@ -624,6 +629,10 @@ static int process_clone(const char *path, u64 offset, u64 len,
 	}
 
 out:
+	if (si) {
+		free(si->path);
+		free(si);
+	}
 	free(full_path);
 	free(full_clone_path);
 	free(subvol_path);
@@ -778,7 +787,7 @@ out:
 }
 
 
-struct btrfs_send_ops send_ops = {
+static struct btrfs_send_ops send_ops = {
 	.subvol = process_subvol,
 	.snapshot = process_snapshot,
 	.mkfile = process_mkfile,
@@ -801,7 +810,7 @@ struct btrfs_send_ops send_ops = {
 	.utimes = process_utimes,
 };
 
-int do_receive(struct btrfs_receive *r, const char *tomnt, int r_fd)
+static int do_receive(struct btrfs_receive *r, const char *tomnt, int r_fd)
 {
 	int ret;
 	char *dest_dir_full_path;
@@ -898,7 +907,7 @@ out:
 	return ret;
 }
 
-static int do_cmd_receive(int argc, char **argv)
+int cmd_receive(int argc, char **argv)
 {
 	int c;
 	char *tomnt = NULL;
@@ -942,19 +951,14 @@ static int do_cmd_receive(int argc, char **argv)
 		receive_fd = open(fromfile, O_RDONLY | O_NOATIME);
 		if (receive_fd < 0) {
 			fprintf(stderr, "ERROR: failed to open %s\n", fromfile);
-			return -errno;
+			return 1;
 		}
 	}
 
 	ret = do_receive(&r, tomnt, receive_fd);
 
-	return ret;
+	return !!ret;
 }
-
-static const char * const receive_cmd_group_usage[] = {
-	"btrfs receive <command> <args>",
-	NULL
-};
 
 const char * const cmd_receive_usage[] = {
 	"btrfs receive [-ve] [-f <infile>] <mount>",
@@ -979,15 +983,3 @@ const char * const cmd_receive_usage[] = {
 	"                 is recognized or on EOF.",
 	NULL
 };
-
-const struct cmd_group receive_cmd_group = {
-	receive_cmd_group_usage, NULL, {
-		{ "receive", do_cmd_receive, cmd_receive_usage, NULL, 0 },
-		{ 0, 0, 0, 0, 0 },
-        },
-};
-
-int cmd_receive(int argc, char **argv)
-{
-	return do_cmd_receive(argc, argv);
-}

@@ -152,7 +152,7 @@ static int load_and_dump_sb(char *filename, int fd, u64 sb_bytenr)
 
 static int check_csum_sblock(void *sb, int csum_size)
 {
-	char result[csum_size];
+	char result[BTRFS_CSUM_SIZE];
 	u32 crc = ~(u32)0;
 
 	crc = btrfs_csum_data(NULL, (char *)sb + BTRFS_CSUM_SIZE,
@@ -186,7 +186,7 @@ static void dump_superblock(struct btrfs_super_block *sb)
 	s = (char *) &sb->magic;
 	for (i = 0; i < 8; i++)
 		putchar(isprint(s[i]) ? s[i] : '.');
-	if (sb->magic == cpu_to_le64(BTRFS_MAGIC))
+	if (btrfs_super_magic(sb) == BTRFS_MAGIC)
 		printf(" [match]\n");
 	else
 		printf(" [DON'T MATCH]\n");
@@ -247,6 +247,8 @@ static void dump_superblock(struct btrfs_super_block *sb)
 	       (unsigned long long)btrfs_super_csum_size(sb));
 	printf("cache_generation\t%llu\n",
 	       (unsigned long long)btrfs_super_cache_generation(sb));
+	printf("uuid_tree_generation\t%llu\n",
+	       (unsigned long long)btrfs_super_uuid_tree_generation(sb));
 
 	uuid_unparse(sb->dev_item.uuid, buf);
 	printf("dev_item.uuid\t\t%s\n", buf);

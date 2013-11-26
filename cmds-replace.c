@@ -97,27 +97,27 @@ static int dev_replace_handle_sigint(int fd)
 }
 
 static const char *const cmd_start_replace_usage[] = {
-	"btrfs replace start srcdev|devid targetdev [-Bfr] mount_point",
+	"btrfs replace start [-Bfr] <srcdev>|<devid> <targetdev> <mount_point>",
 	"Replace device of a btrfs filesystem.",
 	"On a live filesystem, duplicate the data to the target device which",
 	"is currently stored on the source device. If the source device is not",
 	"available anymore, or if the -r option is set, the data is built",
 	"only using the RAID redundancy mechanisms. After completion of the",
 	"operation, the source device is removed from the filesystem.",
-	"If the srcdev is a numerical value, it is assumed to be the device id",
-	"of the filesystem which is mounted at mount_point, otherwise it is",
+	"If the <srcdev> is a numerical value, it is assumed to be the device id",
+	"of the filesystem which is mounted at <mount_point>, otherwise it is",
 	"the path to the source device. If the source device is disconnected,",
-	"from the system, you have to use the devid parameter format.",
-	"The targetdev needs to be same size or larger than the srcdev.",
+	"from the system, you have to use the <devid> parameter format.",
+	"The <targetdev> needs to be same size or larger than the <srcdev>.",
 	"",
-	"-r     only read from srcdev if no other zero-defect mirror exists",
+	"-r     only read from <srcdev> if no other zero-defect mirror exists",
 	"       (enable this if your drive has lots of read errors, the access",
 	"       would be very slow)",
-	"-f     force using and overwriting targetdev even if it looks like",
+	"-f     force using and overwriting <targetdev> even if it looks like",
 	"       containing a valid btrfs filesystem. A valid filesystem is",
 	"       assumed if a btrfs superblock is found which contains a",
 	"       correct checksum. Devices which are currently mounted are",
-	"       never allowed to be used as the targetdev",
+	"       never allowed to be used as the <targetdev>",
 	"-B     do not background",
 	NULL
 };
@@ -137,12 +137,12 @@ static int cmd_start_replace(int argc, char **argv)
 	char *dstdev;
 	int avoid_reading_from_srcdev = 0;
 	int force_using_targetdev = 0;
-	u64 total_devs = 1;
-	struct btrfs_fs_devices *fs_devices_mnt = NULL;
 	struct stat st;
 	u64 dstdev_block_count;
 	int do_not_background = 0;
 	int mixed = 0;
+	DIR *dirstream = NULL;
+	char estr[100]; /* check test_dev_for_mkfs() for error string size*/
 
 	while ((c = getopt(argc, argv, "Brf")) != -1) {
 		switch (c) {
@@ -169,7 +169,7 @@ static int cmd_start_replace(int argc, char **argv)
 		usage(cmd_start_replace_usage);
 	path = argv[optind + 2];
 
-	fdmnt = open_path_or_dev_mnt(path);
+	fdmnt = open_path_or_dev_mnt(path, &dirstream);
 
 	if (fdmnt < 0) {
 		fprintf(stderr, "ERROR: can't access \"%s\": %s\n",
@@ -244,6 +244,7 @@ static int cmd_start_replace(int argc, char **argv)
 		if (fdsrcdev < 0) {
 			fprintf(stderr, "Error: Unable to open device '%s'\n",
 				srcdev);
+			fprintf(stderr, "\tTry using the devid instead of the path\n");
 			goto leave_with_error;
 		}
 		ret = fstat(fdsrcdev, &st);
@@ -263,37 +264,14 @@ static int cmd_start_replace(int argc, char **argv)
 		start_args.start.srcdevid = 0;
 	}
 
-	ret = check_mounted(dstdev);
-	if (ret < 0) {
-		fprintf(stderr, "Error checking %s mount status\n", dstdev);
-		goto leave_with_error;
-	}
-	if (ret == 1) {
-		fprintf(stderr,
-			"Error, target device %s is in use and currently mounted!\n",
-			dstdev);
+	ret = test_dev_for_mkfs(dstdev, force_using_targetdev, estr);
+	if (ret) {
+		fprintf(stderr, "%s", estr);
 		goto leave_with_error;
 	}
 	fddstdev = open(dstdev, O_RDWR);
 	if (fddstdev < 0) {
 		fprintf(stderr, "Unable to open %s\n", dstdev);
-		goto leave_with_error;
-	}
-	ret = btrfs_scan_one_device(fddstdev, dstdev, &fs_devices_mnt,
-				    &total_devs, BTRFS_SUPER_INFO_OFFSET);
-	if (ret >= 0 && !force_using_targetdev) {
-		fprintf(stderr,
-			"Error, target device %s contains filesystem, use '-f' to force overwriting.\n",
-			dstdev);
-		goto leave_with_error;
-	}
-	ret = fstat(fddstdev, &st);
-	if (ret) {
-		fprintf(stderr, "Error: Unable to stat '%s'\n", dstdev);
-		goto leave_with_error;
-	}
-	if (!S_ISBLK(st.st_mode)) {
-		fprintf(stderr, "Error: '%s' is not a block device\n", dstdev);
 		goto leave_with_error;
 	}
 	strncpy((char *)start_args.start.tgtdev_name, dstdev,
@@ -336,7 +314,7 @@ static int cmd_start_replace(int argc, char **argv)
 			goto leave_with_error;
 		}
 	}
-	close(fdmnt);
+	close_file_or_dir(fdmnt, dirstream);
 	return 0;
 
 leave_with_error:
@@ -346,15 +324,15 @@ leave_with_error:
 		close(fdsrcdev);
 	if (fddstdev != -1)
 		close(fddstdev);
-	return -1;
+	return 1;
 }
 
 static const char *const cmd_status_replace_usage[] = {
-	"btrfs replace status mount_point [-1]",
+	"btrfs replace status [-1] <mount_point>",
 	"Print status and progress information of a running device replace",
 	"operation",
 	"",
-	"-1     print once instead of print continously until the replace",
+	"-1     print once instead of print continuously until the replace",
 	"       operation finishes (or is canceled)",
 	NULL
 };
@@ -367,6 +345,7 @@ static int cmd_status_replace(int argc, char **argv)
 	char *path;
 	int once = 0;
 	int ret;
+	DIR *dirstream = NULL;
 
 	while ((c = getopt(argc, argv, "1")) != -1) {
 		switch (c) {
@@ -383,17 +362,17 @@ static int cmd_status_replace(int argc, char **argv)
 		usage(cmd_status_replace_usage);
 
 	path = argv[optind];
-	fd = open_file_or_dir(path);
+	fd = open_file_or_dir(path, &dirstream);
 	e = errno;
 	if (fd < 0) {
 		fprintf(stderr, "ERROR: can't access \"%s\": %s\n",
 			path, strerror(e));
-		return -1;
+		return 1;
 	}
 
 	ret = print_replace_status(fd, path, once);
-	close(fd);
-	return ret;
+	close_file_or_dir(fd, dirstream);
+	return !!ret;
 }
 
 static int print_replace_status(int fd, const char *path, int once)
@@ -520,7 +499,7 @@ progress2string(char *buf, size_t s, int progress_1000)
 }
 
 static const char *const cmd_cancel_replace_usage[] = {
-	"btrfs replace cancel mount_point",
+	"btrfs replace cancel <mount_point>",
 	"Cancel a running device replace operation.",
 	NULL
 };
@@ -533,6 +512,7 @@ static int cmd_cancel_replace(int argc, char **argv)
 	int fd;
 	int e;
 	char *path;
+	DIR *dirstream = NULL;
 
 	while ((c = getopt(argc, argv, "")) != -1) {
 		switch (c) {
@@ -546,24 +526,28 @@ static int cmd_cancel_replace(int argc, char **argv)
 		usage(cmd_cancel_replace_usage);
 
 	path = argv[optind];
-	fd = open_file_or_dir(path);
+	fd = open_file_or_dir(path, &dirstream);
 	if (fd < 0) {
 		fprintf(stderr, "ERROR: can't access \"%s\": %s\n",
 			path, strerror(errno));
-		return -1;
+		return 1;
 	}
 
 	args.cmd = BTRFS_IOCTL_DEV_REPLACE_CMD_CANCEL;
 	ret = ioctl(fd, BTRFS_IOC_DEV_REPLACE, &args);
 	e = errno;
-	close(fd);
+	close_file_or_dir(fd, dirstream);
 	if (ret) {
 		fprintf(stderr, "ERROR: ioctl(DEV_REPLACE_CANCEL) failed on \"%s\": %s, %s\n",
 			path, strerror(e),
 			replace_dev_result2string(args.result));
-		return ret;
+		return 1;
 	}
-
+	if (args.result == BTRFS_IOCTL_DEV_REPLACE_RESULT_NOT_STARTED) {
+		printf("INFO: ioctl(DEV_REPLACE_CANCEL)\"%s\": %s\n",
+			path, replace_dev_result2string(args.result));
+		return 2;
+	}
 	return 0;
 }
 
@@ -575,7 +559,7 @@ const struct cmd_group replace_cmd_group = {
 		  0 },
 		{ "cancel", cmd_cancel_replace, cmd_cancel_replace_usage, NULL,
 		  0 },
-		{ 0, 0, 0, 0, 0 }
+		NULL_CMD_STRUCT
 	}
 };
 

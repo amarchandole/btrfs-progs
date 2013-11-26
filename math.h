@@ -1,5 +1,7 @@
+
 /*
- * Copyright (C) 2010 Oracle.  All rights reserved.
+ * Copyright (C) 2012 Fujitsu.  All rights reserved.
+ * Written by Miao Xie <miaox@cn.fujitsu.com>
  *
  * This program is free software; you can redistribute it and/or
  * modify it under the terms of the GNU General Public
@@ -16,24 +18,16 @@
  * Boston, MA 021110-1307, USA.
  */
 
-#ifndef __CHECKER__
-#include <sys/ioctl.h>
-#include <sys/mount.h>
-#include "ioctl.h"
-#endif
-#include <stdio.h>
-#include <stdlib.h>
-#include <sys/types.h>
-#include <sys/stat.h>
-#include <fcntl.h>
-#include <ctype.h>
-#include <unistd.h>
-#include <dirent.h>
-#include <libgen.h>
-#include <getopt.h>
-#include "kerncompat.h"
-#include "ctree.h"
-#include "transaction.h"
-#include "utils.h"
-#include "version.h"
+#ifndef __BTRFS_MATH_H
+#define __BTRFS_MATH_H
 
+static inline u64 div_factor(u64 num, int factor)
+{
+	if (factor == 10)
+		return num;
+	num *= factor;
+	num /= 10;
+	return num;
+}
+
+#endif

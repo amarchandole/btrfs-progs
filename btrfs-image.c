@@ -35,6 +35,7 @@
 #include "utils.h"
 #include "version.h"
 #include "volumes.h"
+#include "extent_io.h"
 
 #define HEADER_MAGIC		0xbd5c25e27295668bULL
 #define MAX_PENDING_SIZE	(256 * 1024)
@@ -136,8 +137,12 @@ struct mdrestore_struct {
 	int done;
 	int error;
 	int old_restore;
+	int fixup_offset;
+	int multi_devices;
+	struct btrfs_fs_info *info;
 };
 
+static void print_usage(void) __attribute__((noreturn));
 static int search_for_chunk_blocks(struct mdrestore_struct *mdres,
 				   u64 search, u64 cluster_bytenr);
 static struct extent_buffer *alloc_dummy_eb(u64 bytenr, u32 size);
@@ -158,6 +163,7 @@ static int has_name(struct btrfs_key *key)
 	case BTRFS_DIR_INDEX_KEY:
 	case BTRFS_INODE_REF_KEY:
 	case BTRFS_INODE_EXTREF_KEY:
+	case BTRFS_XATTR_ITEM_KEY:
 		return 1;
 	default:
 		break;
@@ -279,6 +285,7 @@ static char *find_collision(struct metadump_struct *md, char *name,
 	val = malloc(sizeof(struct name));
 	if (!val) {
 		fprintf(stderr, "Couldn't sanitize name, enomem\n");
+		free(name);
 		return NULL;
 	}
 
@@ -290,6 +297,7 @@ static char *find_collision(struct metadump_struct *md, char *name,
 	if (!val->sub) {
 		fprintf(stderr, "Couldn't sanitize name, enomem\n");
 		free(val);
+		free(name);
 		return NULL;
 	}
 
@@ -306,11 +314,11 @@ static char *find_collision(struct metadump_struct *md, char *name,
 		if (val->sub[i] == 127) {
 			do {
 				i++;
-				if (i > name_len)
+				if (i >= name_len)
 					break;
 			} while (val->sub[i] == 127);
 
-			if (i > name_len)
+			if (i >= name_len)
 				break;
 			val->sub[i]++;
 			if (val->sub[i] == '/')
@@ -442,6 +450,21 @@ static void sanitize_inode_ref(struct metadump_struct *md,
 	}
 }
 
+static void sanitize_xattr(struct metadump_struct *md,
+			   struct extent_buffer *eb, int slot)
+{
+	struct btrfs_dir_item *dir_item;
+	unsigned long data_ptr;
+	u32 data_len;
+
+	dir_item = btrfs_item_ptr(eb, slot, struct btrfs_dir_item);
+	data_len = btrfs_dir_data_len(eb, dir_item);
+
+	data_ptr = (unsigned long)((char *)(dir_item + 1) +
+				   btrfs_dir_name_len(eb, dir_item));
+	memset_extent_buffer(eb, 0, data_ptr, data_len);
+}
+
 static void sanitize_name(struct metadump_struct *md, u8 *dst,
 			  struct extent_buffer *src, struct btrfs_key *key,
 			  int slot)
@@ -467,6 +490,9 @@ static void sanitize_name(struct metadump_struct *md, u8 *dst,
 	case BTRFS_INODE_EXTREF_KEY:
 		sanitize_inode_ref(md, eb, slot, 1);
 		break;
+	case BTRFS_XATTR_ITEM_KEY:
+		sanitize_xattr(md, eb, slot);
+		break;
 	default:
 		break;
 	}
@@ -490,7 +516,7 @@ static void zero_items(struct metadump_struct *md, u8 *dst,
 	int i, extent_type;
 
 	for (i = 0; i < nritems; i++) {
-		item = btrfs_item_nr(src, i);
+		item = btrfs_item_nr(i);
 		btrfs_item_key_to_cpu(src, &key, i);
 		if (key.type == BTRFS_CSUM_ITEM_KEY) {
 			size = btrfs_item_size_nr(src, i);
@@ -1110,7 +1136,7 @@ static int copy_space_cache(struct btrfs_root *root,
 		if (ret) {
 			fprintf(stderr, "Error adding space cache blocks %d\n",
 				ret);
-			btrfs_release_path(root, path);
+			btrfs_release_path(path);
 			return ret;
 		}
 		path->slots[0]++;
@@ -1169,9 +1195,9 @@ static int copy_from_extent_tree(struct metadump_struct *metadump,
 
 		bytenr = key.objectid;
 		if (key.type == BTRFS_METADATA_ITEM_KEY)
-			num_bytes = key.offset;
-		else
 			num_bytes = extent_root->leafsize;
+		else
+			num_bytes = key.offset;
 
 		if (btrfs_item_size_nr(leaf, path->slots[0]) > sizeof(*ei)) {
 			ei = btrfs_item_ptr(leaf, path->slots[0],
@@ -1215,7 +1241,7 @@ static int copy_from_extent_tree(struct metadump_struct *metadump,
 		bytenr += num_bytes;
 	}
 
-	btrfs_release_path(extent_root, path);
+	btrfs_release_path(path);
 
 	return ret;
 }
@@ -1332,7 +1358,7 @@ static void update_super_old(u8 *buffer)
 	btrfs_set_stack_chunk_num_stripes(chunk, 1);
 	btrfs_set_stack_chunk_sub_stripes(chunk, 0);
 	chunk->stripe.devid = super->dev_item.devid;
-	chunk->stripe.offset = cpu_to_le64(0);
+	btrfs_set_stack_stripe_offset(&chunk->stripe, 0);
 	memcpy(chunk->stripe.dev_uuid, super->dev_item.uuid, BTRFS_UUID_SIZE);
 	btrfs_set_super_sys_array_size(super, sizeof(*key) + sizeof(*chunk));
 	csum_block(buffer, 4096);
@@ -1433,7 +1459,7 @@ static void truncate_item(struct extent_buffer *eb, int slot, u32 new_size)
 
 	for (i = slot; i < nritems; i++) {
 		u32 ioff;
-		item = btrfs_item_nr(eb, i);
+		item = btrfs_item_nr(i);
 		ioff = btrfs_item_offset(eb, item);
 		btrfs_set_item_offset(eb, item, ioff + size_diff);
 	}
@@ -1441,7 +1467,7 @@ static void truncate_item(struct extent_buffer *eb, int slot, u32 new_size)
 	memmove_extent_buffer(eb, btrfs_leaf_data(eb) + data_end + size_diff,
 			      btrfs_leaf_data(eb) + data_end,
 			      old_data_start + new_size - data_end);
-	item = btrfs_item_nr(eb, slot);
+	item = btrfs_item_nr(slot);
 	btrfs_set_item_size(eb, item, new_size);
 }
 
@@ -1515,6 +1541,7 @@ next:
 		bytenr += mdres->leafsize;
 	}
 
+	free(eb);
 	return 0;
 }
 
@@ -1589,9 +1616,10 @@ static void *restore_worker(void *data)
 	u8 *outbuf;
 	int outfd;
 	int ret;
+	int compress_size = MAX_PENDING_SIZE * 4;
 
 	outfd = fileno(mdres->out);
-	buffer = malloc(MAX_PENDING_SIZE * 2);
+	buffer = malloc(compress_size);
 	if (!buffer) {
 		fprintf(stderr, "Error allocing buffer\n");
 		pthread_mutex_lock(&mdres->mutex);
@@ -1619,7 +1647,7 @@ static void *restore_worker(void *data)
 		pthread_mutex_unlock(&mdres->mutex);
 
 		if (mdres->compress_method == COMPRESS_ZLIB) {
-			size = MAX_PENDING_SIZE * 2;
+			size = compress_size; 
 			ret = uncompress(buffer, (unsigned long *)&size,
 					 async->buffer, async->bufsize);
 			if (ret != Z_OK) {
@@ -1633,44 +1661,60 @@ static void *restore_worker(void *data)
 			size = async->bufsize;
 		}
 
-		if (async->start == BTRFS_SUPER_INFO_OFFSET) {
-			if (mdres->old_restore) {
-				update_super_old(outbuf);
-			} else {
-				ret = update_super(outbuf);
+		if (!mdres->multi_devices) {
+			if (async->start == BTRFS_SUPER_INFO_OFFSET) {
+				if (mdres->old_restore) {
+					update_super_old(outbuf);
+				} else {
+					ret = update_super(outbuf);
+					if (ret)
+						err = ret;
+				}
+			} else if (!mdres->old_restore) {
+				ret = fixup_chunk_tree_block(mdres, async, outbuf, size);
 				if (ret)
 					err = ret;
 			}
-		} else if (!mdres->old_restore) {
-			ret = fixup_chunk_tree_block(mdres, async, outbuf, size);
-			if (ret)
-				err = ret;
 		}
 
-		while (size) {
-			u64 chunk_size = size;
-			bytenr = logical_to_physical(mdres,
-						     async->start + offset,
-						     &chunk_size);
-			ret = pwrite64(outfd, outbuf+offset, chunk_size,
-				       bytenr);
-			if (ret < chunk_size) {
-				if (ret < 0) {
-					fprintf(stderr, "Error writing to "
-						"device %d\n", errno);
-					err = errno;
-					break;
-				} else {
-					fprintf(stderr, "Short write\n");
-					err = -EIO;
-					break;
+		if (!mdres->fixup_offset) {
+			while (size) {
+				u64 chunk_size = size;
+				if (!mdres->multi_devices)
+					bytenr = logical_to_physical(mdres,
+								     async->start + offset,
+								     &chunk_size);
+				else
+					bytenr = async->start + offset;
+
+				ret = pwrite64(outfd, outbuf+offset, chunk_size,
+					       bytenr);
+				if (ret != chunk_size) {
+					if (ret < 0) {
+						fprintf(stderr, "Error writing to "
+							"device %d\n", errno);
+						err = errno;
+						break;
+					} else {
+						fprintf(stderr, "Short write\n");
+						err = -EIO;
+						break;
+					}
 				}
+				size -= chunk_size;
+				offset += chunk_size;
 			}
-			size -= chunk_size;
-			offset += chunk_size;
+		} else if (async->start != BTRFS_SUPER_INFO_OFFSET) {
+			ret = write_data_to_disk(mdres->info, outbuf, async->start, size, 0);
+			if (ret) {
+				printk("Error write data\n");
+				exit(1);
+			}
 		}
 
-		if (async->start == BTRFS_SUPER_INFO_OFFSET)
+
+		/* backup super blocks are already there at fixup_offset stage */
+		if (!mdres->multi_devices && async->start == BTRFS_SUPER_INFO_OFFSET)
 			write_backup_supers(outfd, outbuf);
 
 		pthread_mutex_lock(&mdres->mutex);
@@ -1714,7 +1758,8 @@ static void mdrestore_destroy(struct mdrestore_struct *mdres)
 
 static int mdrestore_init(struct mdrestore_struct *mdres,
 			  FILE *in, FILE *out, int old_restore,
-			  int num_threads)
+			  int num_threads, int fixup_offset,
+			  struct btrfs_fs_info *info, int multi_devices)
 {
 	int i, ret = 0;
 
@@ -1726,6 +1771,9 @@ static int mdrestore_init(struct mdrestore_struct *mdres,
 	mdres->out = out;
 	mdres->old_restore = old_restore;
 	mdres->chunk_tree.rb_node = NULL;
+	mdres->fixup_offset = fixup_offset;
+	mdres->info = info;
+	mdres->multi_devices = multi_devices;
 
 	if (!num_threads)
 		return 0;
@@ -1964,6 +2012,7 @@ static int search_for_chunk_blocks(struct mdrestore_struct *mdres,
 	u64 current_cluster = cluster_bytenr, bytenr;
 	u64 item_bytenr;
 	u32 bufsize, nritems, i;
+	u32 max_size = MAX_PENDING_SIZE * 2;
 	u8 *buffer, *tmp = NULL;
 	int ret = 0;
 
@@ -1973,7 +2022,7 @@ static int search_for_chunk_blocks(struct mdrestore_struct *mdres,
 		return -ENOMEM;
 	}
 
-	buffer = malloc(MAX_PENDING_SIZE * 2);
+	buffer = malloc(max_size);
 	if (!buffer) {
 		fprintf(stderr, "Error allocing buffer\n");
 		free(cluster);
@@ -1981,7 +2030,7 @@ static int search_for_chunk_blocks(struct mdrestore_struct *mdres,
 	}
 
 	if (mdres->compress_method == COMPRESS_ZLIB) {
-		tmp = malloc(MAX_PENDING_SIZE * 2);
+		tmp = malloc(max_size);
 		if (!tmp) {
 			fprintf(stderr, "Error allocing tmp buffer\n");
 			free(cluster);
@@ -2032,6 +2081,13 @@ static int search_for_chunk_blocks(struct mdrestore_struct *mdres,
 			bufsize = le32_to_cpu(item->size);
 			item_bytenr = le64_to_cpu(item->bytenr);
 
+			if (bufsize > max_size) {
+				fprintf(stderr, "item %u size %u too big\n",
+					i, bufsize);
+				ret = -EIO;
+				break;
+			}
+
 			if (mdres->compress_method == COMPRESS_ZLIB) {
 				ret = fread(tmp, bufsize, 1, mdres->in);
 				if (ret != 1) {
@@ -2041,7 +2097,7 @@ static int search_for_chunk_blocks(struct mdrestore_struct *mdres,
 					break;
 				}
 
-				size = MAX_PENDING_SIZE * 2;
+				size = max_size;
 				ret = uncompress(buffer,
 						 (unsigned long *)&size, tmp,
 						 bufsize);
@@ -2186,12 +2242,14 @@ static int build_chunk_tree(struct mdrestore_struct *mdres,
 	return search_for_chunk_blocks(mdres, chunk_root_bytenr, 0);
 }
 
-static int restore_metadump(const char *input, FILE *out, int old_restore,
-			    int num_threads)
+static int __restore_metadump(const char *input, FILE *out, int old_restore,
+			      int num_threads, int fixup_offset,
+			      const char *target, int multi_devices)
 {
 	struct meta_cluster *cluster = NULL;
 	struct meta_cluster_header *header;
 	struct mdrestore_struct mdrestore;
+	struct btrfs_fs_info *info = NULL;
 	u64 bytenr = 0;
 	FILE *in = NULL;
 	int ret = 0;
@@ -2206,26 +2264,39 @@ static int restore_metadump(const char *input, FILE *out, int old_restore,
 		}
 	}
 
+	/* NOTE: open with write mode */
+	if (fixup_offset) {
+		BUG_ON(!target);
+		info = open_ctree_fs_info(target, 0, 0,
+					  OPEN_CTREE_WRITES |
+					  OPEN_CTREE_RESTORE |
+					  OPEN_CTREE_PARTIAL);
+		if (!info) {
+			fprintf(stderr, "%s: open ctree failed\n", __func__);
+			ret = -EIO;
+			goto failed_open;
+		}
+	}
+
 	cluster = malloc(BLOCK_SIZE);
 	if (!cluster) {
 		fprintf(stderr, "Error allocating cluster\n");
-		if (in != stdin)
-			fclose(in);
-		return -ENOMEM;
+		ret = -ENOMEM;
+		goto failed_info;
 	}
 
-	ret = mdrestore_init(&mdrestore, in, out, old_restore, num_threads);
+	ret = mdrestore_init(&mdrestore, in, out, old_restore, num_threads,
+			     fixup_offset, info, multi_devices);
 	if (ret) {
 		fprintf(stderr, "Error initing mdrestore %d\n", ret);
-		if (in != stdin)
-			fclose(in);
-		free(cluster);
-		return ret;
+		goto failed_cluster;
 	}
 
-	ret = build_chunk_tree(&mdrestore, cluster);
-	if (ret)
-		goto out;
+	if (!multi_devices) {
+		ret = build_chunk_tree(&mdrestore, cluster);
+		if (ret)
+			goto out;
+	}
 
 	if (in != stdin && fseek(in, 0, SEEK_SET)) {
 		fprintf(stderr, "Error seeking %d\n", errno);
@@ -2259,10 +2330,121 @@ static int restore_metadump(const char *input, FILE *out, int old_restore,
 	}
 out:
 	mdrestore_destroy(&mdrestore);
+failed_cluster:
 	free(cluster);
+failed_info:
+	if (fixup_offset && info)
+		close_ctree(info->chunk_root);
+failed_open:
 	if (in != stdin)
 		fclose(in);
 	return ret;
+}
+
+static int restore_metadump(const char *input, FILE *out, int old_restore,
+			    int num_threads, int multi_devices)
+{
+	return __restore_metadump(input, out, old_restore, num_threads, 0, NULL,
+				  multi_devices);
+}
+
+static int fixup_metadump(const char *input, FILE *out, int num_threads,
+			  const char *target)
+{
+	return __restore_metadump(input, out, 0, num_threads, 1, target, 1);
+}
+
+static int update_disk_super_on_device(struct btrfs_fs_info *info,
+				       const char *other_dev, u64 cur_devid)
+{
+	struct btrfs_key key;
+	struct extent_buffer *leaf;
+	struct btrfs_path path;
+	struct btrfs_dev_item *dev_item;
+	struct btrfs_super_block *disk_super;
+	char dev_uuid[BTRFS_UUID_SIZE];
+	char fs_uuid[BTRFS_UUID_SIZE];
+	u64 devid, type, io_align, io_width;
+	u64 sector_size, total_bytes, bytes_used;
+	char *buf;
+	int fp;
+	int ret;
+
+	key.objectid = BTRFS_DEV_ITEMS_OBJECTID;
+	key.type = BTRFS_DEV_ITEM_KEY;
+	key.offset = cur_devid;
+
+	btrfs_init_path(&path);
+	ret = btrfs_search_slot(NULL, info->chunk_root, &key, &path, 0, 0); 
+	if (ret) {
+		fprintf(stderr, "search key fails\n");
+		exit(1);
+	}
+
+	leaf = path.nodes[0];
+	dev_item = btrfs_item_ptr(leaf, path.slots[0],
+				  struct btrfs_dev_item);
+
+	devid = btrfs_device_id(leaf, dev_item);
+	if (devid != cur_devid) {
+		printk("devid %llu mismatch with %llu\n", devid, cur_devid);
+		exit(1);
+	}
+
+	type = btrfs_device_type(leaf, dev_item);
+	io_align = btrfs_device_io_align(leaf, dev_item);
+	io_width = btrfs_device_io_width(leaf, dev_item);
+	sector_size = btrfs_device_sector_size(leaf, dev_item);
+	total_bytes = btrfs_device_total_bytes(leaf, dev_item);
+	bytes_used = btrfs_device_bytes_used(leaf, dev_item);
+	read_extent_buffer(leaf, dev_uuid, (unsigned long)btrfs_device_uuid(dev_item), BTRFS_UUID_SIZE);
+	read_extent_buffer(leaf, fs_uuid, (unsigned long)btrfs_device_fsid(dev_item), BTRFS_UUID_SIZE);
+
+	btrfs_release_path(&path);
+
+	printk("update disk super on %s devid=%llu\n", other_dev, devid);
+
+	/* update other devices' super block */
+	fp = open(other_dev, O_CREAT | O_RDWR, 0600);
+	if (fp < 0) {
+		fprintf(stderr, "could not open %s\n", other_dev);
+		exit(1);
+	}
+
+	buf = malloc(BTRFS_SUPER_INFO_SIZE);
+	if (!buf) {
+		ret = -ENOMEM;
+		exit(1);
+	}
+
+	memcpy(buf, info->super_copy, BTRFS_SUPER_INFO_SIZE);
+
+	disk_super = (struct btrfs_super_block *)buf;
+	dev_item = &disk_super->dev_item;
+
+	btrfs_set_stack_device_type(dev_item, type);
+	btrfs_set_stack_device_id(dev_item, devid);
+	btrfs_set_stack_device_total_bytes(dev_item, total_bytes);
+	btrfs_set_stack_device_bytes_used(dev_item, bytes_used);
+	btrfs_set_stack_device_io_align(dev_item, io_align);
+	btrfs_set_stack_device_io_width(dev_item, io_width);
+	btrfs_set_stack_device_sector_size(dev_item, sector_size);
+	memcpy(dev_item->uuid, dev_uuid, BTRFS_UUID_SIZE);
+	memcpy(dev_item->fsid, fs_uuid, BTRFS_UUID_SIZE);
+	csum_block((u8 *)buf, BTRFS_SUPER_INFO_SIZE);
+
+	ret = pwrite64(fp, buf, BTRFS_SUPER_INFO_SIZE, BTRFS_SUPER_INFO_OFFSET);
+	if (ret != BTRFS_SUPER_INFO_SIZE) {
+		ret = -EIO;
+		goto out;
+	}
+
+	write_backup_supers(fp, (u8 *)buf);
+
+out:
+	free(buf);
+	close(fp);
+	return 0;
 }
 
 static void print_usage(void)
@@ -2272,7 +2454,7 @@ static void print_usage(void)
 	fprintf(stderr, "\t-c value\tcompression level (0 ~ 9)\n");
 	fprintf(stderr, "\t-t value\tnumber of threads (1 ~ 32)\n");
 	fprintf(stderr, "\t-o      \tdon't mess with the chunk tree when restoring\n");
-	fprintf(stderr, "\t-s      \tsanitize file names, use once to just use garbage, use twice if you want crc collisions");
+	fprintf(stderr, "\t-s      \tsanitize file names, use once to just use garbage, use twice if you want crc collisions\n");
 	fprintf(stderr, "\t-w      \twalk all trees instead of using extent tree, do this if your extent tree is broken\n");
 	exit(1);
 }
@@ -2286,12 +2468,14 @@ int main(int argc, char *argv[])
 	int create = 1;
 	int old_restore = 0;
 	int walk_trees = 0;
+	int multi_devices = 0;
 	int ret;
 	int sanitize = 0;
+	int dev_cnt = 0;
 	FILE *out;
 
 	while (1) {
-		int c = getopt(argc, argv, "rc:t:osw");
+		int c = getopt(argc, argv, "rc:t:oswm");
 		if (c < 0)
 			break;
 		switch (c) {
@@ -2317,17 +2501,26 @@ int main(int argc, char *argv[])
 		case 'w':
 			walk_trees = 1;
 			break;
+		case 'm':
+			create = 0;
+			multi_devices = 1;
+			break;
 		default:
 			print_usage();
 		}
 	}
 
-	if (old_restore && create)
+	if ((old_restore) && create)
 		print_usage();
 
 	argc = argc - optind;
-	if (argc != 2)
+	dev_cnt = argc - 1;
+
+	if (multi_devices && dev_cnt < 2)
 		print_usage();
+	if (!multi_devices && dev_cnt != 1)
+		print_usage();
+
 	source = argv[optind];
 	target = argv[optind + 1];
 
@@ -2351,12 +2544,66 @@ int main(int argc, char *argv[])
 		ret = create_metadump(source, out, num_threads,
 				      compress_level, sanitize, walk_trees);
 	else
-		ret = restore_metadump(source, out, old_restore, 1);
+		ret = restore_metadump(source, out, old_restore, 1,
+				       multi_devices);
+	if (ret) {
+		printk("%s failed (%s)\n", (create) ? "create" : "restore",
+		       strerror(errno));
+		goto out;
+	}
 
+	 /* extended support for multiple devices */
+	if (!create && multi_devices) {
+		struct btrfs_fs_info *info;
+		u64 total_devs;
+		int i;
+
+		info = open_ctree_fs_info(target, 0, 0,
+					  OPEN_CTREE_PARTIAL |
+					  OPEN_CTREE_RESTORE);
+		if (!info) {
+			int e = errno;
+			fprintf(stderr, "unable to open %s error = %s\n",
+				target, strerror(e));
+			return 1;
+		}
+
+		total_devs = btrfs_super_num_devices(info->super_copy);
+		if (total_devs != dev_cnt) {
+			printk("it needs %llu devices but has only %d\n",
+				total_devs, dev_cnt);
+			close_ctree(info->chunk_root);
+			goto out;
+		}
+
+		/* update super block on other disks */
+		for (i = 2; i <= dev_cnt; i++) {
+			ret = update_disk_super_on_device(info,
+					argv[optind + i], (u64)i);
+			if (ret) {
+				printk("update disk super failed devid=%d (error=%d)\n",
+					i, ret);
+				close_ctree(info->chunk_root);
+				exit(1);
+			}
+		}
+
+		close_ctree(info->chunk_root);
+
+		/* fix metadata block to map correct chunk */
+		ret = fixup_metadump(source, out, 1, target);
+		if (ret) {
+			fprintf(stderr, "fix metadump failed (error=%d)\n",
+				ret);
+			exit(1);
+		}
+	}
+
+out:
 	if (out == stdout)
 		fflush(out);
 	else
 		fclose(out);
 
-	return ret;
+	return !!ret;
 }

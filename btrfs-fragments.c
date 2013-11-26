@@ -87,7 +87,7 @@ print_bg(FILE *html, char *name, u64 start, u64 len, u64 used, u64 flags,
 
 	fprintf(html, "<p>%s chunk starts at %lld, size is %s, %.2f%% used, "
 		      "%.2f%% fragmented</p>\n", chunk_type(flags), start,
-		      pretty_sizes(len), 100.0 * used / len, 100.0 * frag);
+		      pretty_size(len), 100.0 * used / len, 100.0 * frag);
 	fprintf(html, "<img src=\"%s\" border=\"1\" />\n", name);
 }
 
@@ -191,7 +191,6 @@ list_fragments(int fd, u64 flags, char *dir)
 	u64 bgused = 0;
 	u64 saved_extent = 0;
 	u64 saved_len = 0;
-	u64 saved_flags = 0;
 	int saved_color = 0;
 	u64 last_end = 0;
 	u64 areas = 0;
@@ -202,7 +201,6 @@ list_fragments(int fd, u64 flags, char *dir)
 
 	gdImagePtr im = NULL;
 	int black = 0;
-	int white = 0;
 	int width = 800;
 
 	snprintf(name, sizeof(name), "%s/index.html", dir);
@@ -280,10 +278,9 @@ list_fragments(int fd, u64 flags, char *dir)
 				im = gdImageCreate(width,
 					(sh->offset / 4096 + 799) / width);
 
-				white = gdImageColorAllocate(im, 255, 255, 255);
 				black = gdImageColorAllocate(im, 0, 0, 0);  
 
-				for (j = 0; j < 10; ++j)
+				for (j = 0; j < ARRAY_SIZE(colors); ++j)
 					colors[j] = black;
 
 				init_colors(im, colors);
@@ -308,13 +305,11 @@ list_fragments(int fd, u64 flags, char *dir)
 				saved_len = 0;
 			}
 			if (im && sh->type == BTRFS_EXTENT_ITEM_KEY) {
-				u64 e_flags;
 				int c;
 				struct btrfs_extent_item *item;
 
 				item = (struct btrfs_extent_item *)
 						(args.buf + off);
-				e_flags = btrfs_stack_extent_flags(item);
 
 				if (use_color)
 					c = colors[get_color(item, sh->len)];
@@ -328,7 +323,6 @@ list_fragments(int fd, u64 flags, char *dir)
 				if (sh->objectid == bgend) {
 					saved_extent = sh->objectid;
 					saved_len = sh->offset;
-					saved_flags = e_flags;
 					saved_color = c;
 					goto skip;
 				}
@@ -403,6 +397,7 @@ int main(int argc, char **argv)
 	int ret;
 	u64 flags = 0;
 	char *dir = "html";
+	DIR *dirstream = NULL;
 
 	while (1) {
 		int c = getopt(argc, argv, "cmso:h");
@@ -437,7 +432,7 @@ int main(int argc, char **argv)
 		exit(1);
 	}
 
-	fd = open_file_or_dir(path);
+	fd = open_file_or_dir(path, &dirstream);
 	if (fd < 0) {
 		fprintf(stderr, "ERROR: can't access '%s'\n", path);
 		exit(1);
@@ -447,6 +442,7 @@ int main(int argc, char **argv)
 		flags = BTRFS_BLOCK_GROUP_DATA | BTRFS_BLOCK_GROUP_METADATA;
 
 	ret = list_fragments(fd, flags, dir);
+	close_file_or_dir(fd, dirstream);
 	if (ret)
 		exit(1);
 

@@ -27,7 +27,7 @@
 #include "transaction.h"
 
 /* for testing only */
-int next_key(int i, int max_key) {
+static int next_key(int i, int max_key) {
 	return rand() % max_key;
 	// return i;
 }
@@ -51,7 +51,7 @@ int main(int ac, char **av) {
 
 	radix_tree_init();
 
-	root = open_ctree(av[1], BTRFS_SUPER_INFO_OFFSET, O_RDWR);
+	root = open_ctree(av[1], BTRFS_SUPER_INFO_OFFSET, OPEN_CTREE_WRITES);
 	if (!root) {
 		fprintf(stderr, "Open ctree failed\n");
 		exit(1);
@@ -78,7 +78,7 @@ int main(int ac, char **av) {
 	btrfs_commit_transaction(trans, root);
 	close_ctree(root);
 	exit(1);
-	root = open_ctree(av[1], BTRFS_SUPER_INFO_OFFSET, O_RDWR);
+	root = open_ctree(av[1], BTRFS_SUPER_INFO_OFFSET, OPEN_CTREE_WRITES);
 	if (!root) {
 		fprintf(stderr, "Open ctree failed\n");
 		exit(1);
@@ -97,11 +97,11 @@ int main(int ac, char **av) {
 			printf("unable to find %d\n", num);
 			exit(1);
 		}
-		btrfs_release_path(root, &path);
+		btrfs_release_path(&path);
 	}
 	close_ctree(root);
 
-	root = open_ctree(av[1], BTRFS_SUPER_INFO_OFFSET, O_RDWR);
+	root = open_ctree(av[1], BTRFS_SUPER_INFO_OFFSET, OPEN_CTREE_WRITES);
 	if (!root) {
 		fprintf(stderr, "Open ctree failed\n");
 		exit(1);
@@ -128,12 +128,12 @@ int main(int ac, char **av) {
 				BUG();
 			tree_size--;
 		}
-		btrfs_release_path(root, &path);
+		btrfs_release_path(&path);
 	}
 	btrfs_commit_transaction(trans, root);
 	close_ctree(root);
 
-	root = open_ctree(av[1], BTRFS_SUPER_INFO_OFFSET, O_RDWR);
+	root = open_ctree(av[1], BTRFS_SUPER_INFO_OFFSET, OPEN_CTREE_WRITES);
 	if (!root) {
 		fprintf(stderr, "Open ctree failed\n");
 		exit(1);
@@ -153,7 +153,7 @@ int main(int ac, char **av) {
 	btrfs_commit_transaction(trans, root);
 	close_ctree(root);
 
-	root = open_ctree(av[1], BTRFS_SUPER_INFO_OFFSET, O_RDWR);
+	root = open_ctree(av[1], BTRFS_SUPER_INFO_OFFSET, OPEN_CTREE_WRITES);
 	if (!root) {
 		fprintf(stderr, "Open ctree failed\n");
 		exit(1);
@@ -172,7 +172,7 @@ int main(int ac, char **av) {
 			printf("unable to find %d\n", num);
 			exit(1);
 		}
-		btrfs_release_path(root, &path);
+		btrfs_release_path(&path);
 	}
 	printf("starting big long delete run\n");
 	trans = btrfs_start_transaction(root, 1);
@@ -205,7 +205,7 @@ int main(int ac, char **av) {
 			}
 			tree_size--;
 		}
-		btrfs_release_path(root, &path);
+		btrfs_release_path(&path);
 	}
 	/*
 	printf("previous tree:\n");

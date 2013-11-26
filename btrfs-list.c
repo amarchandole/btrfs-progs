@@ -17,11 +17,9 @@
  */
 
 #define _GNU_SOURCE
-#ifndef __CHECKER__
 #include <sys/ioctl.h>
 #include <sys/mount.h>
 #include "ioctl.h"
-#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <sys/types.h>
@@ -46,7 +44,7 @@ struct root_lookup {
 	struct rb_root root;
 };
 
-struct {
+static struct {
 	char	*name;
 	char	*column_name;
 	int	need_print;
@@ -240,9 +238,8 @@ void btrfs_list_free_comparer_set(struct btrfs_list_comparer_set *comp_set)
 	free(comp_set);
 }
 
-int btrfs_list_setup_comparer(struct btrfs_list_comparer_set  **comp_set,
-			      enum btrfs_list_comp_enum comparer,
-			      int is_descending)
+static int btrfs_list_setup_comparer(struct btrfs_list_comparer_set **comp_set,
+		enum btrfs_list_comp_enum comparer, int is_descending)
 {
 	struct btrfs_list_comparer_set *set = *comp_set;
 	int size;
@@ -513,8 +510,11 @@ static int add_root(struct root_lookup *root_lookup,
 	return 0;
 }
 
-void __free_root_info(struct root_info *ri)
+static void __free_root_info(struct rb_node *node)
 {
+	struct root_info *ri;
+
+	ri = rb_entry(node, struct root_info, rb_node);
 	if (ri->name)
 		free(ri->name);
 
@@ -527,19 +527,9 @@ void __free_root_info(struct root_info *ri)
 	free(ri);
 }
 
-void __free_all_subvolumn(struct root_lookup *root_tree)
+static inline void __free_all_subvolumn(struct root_lookup *root_tree)
 {
-	struct root_info *entry;
-	struct rb_node *n;
-
-	n = rb_first(&root_tree->root);
-	while (n) {
-		entry = rb_entry(n, struct root_info, rb_node);
-		rb_erase(n, &root_tree->root);
-		__free_root_info(entry);
-
-		n = rb_first(&root_tree->root);
-	}
+	rb_free_nodes(&root_tree->root, __free_root_info);
 }
 
 /*
@@ -827,7 +817,7 @@ static char *__ino_resolve(int fd, u64 dirid)
  * simple string builder, returning a new string with both
  * dirid and name
  */
-char *build_name(char *dirid, char *name)
+static char *build_name(char *dirid, char *name)
 {
 	char *full;
 	if (!dirid)
@@ -1059,7 +1049,7 @@ static int __list_subvol_search(int fd, struct root_lookup *root_lookup)
 				flags = btrfs_root_flags(ri);
 				if(sh.len >
 				   sizeof(struct btrfs_root_item_v0)) {
-					t = ri->otime.sec;
+					t = btrfs_stack_timespec_sec(&ri->otime);
 					ogen = btrfs_root_otransid(ri);
 					memcpy(uuid, ri->uuid, BTRFS_UUID_SIZE);
 					memcpy(puuid, ri->parent_uuid, BTRFS_UUID_SIZE);
@@ -1183,6 +1173,11 @@ static int filter_by_parent(struct root_info *ri, u64 data)
 	return !uuid_compare(ri->puuid, (u8 *)(unsigned long)data);
 }
 
+static int filter_deleted(struct root_info *ri, u64 data)
+{
+	return ri->deleted;
+}
+
 static btrfs_list_filter_func all_filter_funcs[] = {
 	[BTRFS_LIST_FILTER_ROOTID]		= filter_by_rootid,
 	[BTRFS_LIST_FILTER_SNAPSHOT_ONLY]	= filter_snapshot,
@@ -1196,6 +1191,7 @@ static btrfs_list_filter_func all_filter_funcs[] = {
 	[BTRFS_LIST_FILTER_TOPID_EQUAL]		= filter_topid_equal,
 	[BTRFS_LIST_FILTER_FULL_PATH]		= filter_full_path,
 	[BTRFS_LIST_FILTER_BY_PARENT]		= filter_by_parent,
+	[BTRFS_LIST_FILTER_DELETED]		= filter_deleted,
 };
 
 struct btrfs_list_filter_set *btrfs_list_alloc_filter_set(void)
@@ -1232,6 +1228,11 @@ int btrfs_list_setup_filter(struct btrfs_list_filter_set **filter_set,
 	BUG_ON(filter >= BTRFS_LIST_FILTER_MAX);
 	BUG_ON(set->nfilters > set->total);
 
+	if (filter == BTRFS_LIST_FILTER_DELETED) {
+		set->only_deleted = 1;
+		return 0;
+	}
+
 	if (set->nfilters == set->total) {
 		size = set->total + BTRFS_LIST_NFILTERS_INCREASE;
 		size = sizeof(*set) + size * sizeof(struct btrfs_list_filter);
@@ -1264,6 +1265,12 @@ static int filter_root(struct root_info *ri,
 	if (!set || !set->nfilters)
 		return 1;
 
+	if (set->only_deleted && !ri->deleted)
+		return 0;
+
+	if (!set->only_deleted && ri->deleted)
+		return 0;
+
 	for (i = 0; i < set->nfilters; i++) {
 		if (!set->filters[i].filter_func)
 			break;
@@ -1291,12 +1298,13 @@ static void __filter_and_sort_subvol(struct root_lookup *all_subvols,
 		entry = rb_entry(n, struct root_info, rb_node);
 
 		ret = resolve_root(all_subvols, entry, top_id);
-		if (ret == -ENOENT)
-			goto skip;
+		if (ret == -ENOENT) {
+			entry->full_path = strdup("DELETED");
+			entry->deleted = 1;
+		}
 		ret = filter_root(entry, filter_set);
 		if (ret)
 			sort_tree_insert(sort_tree, entry, comp_set);
-skip:
 		n = rb_prev(n);
 	}
 }
@@ -1344,10 +1352,12 @@ static void print_subvolume_column(struct root_info *subv,
 		printf("%llu", subv->top_id);
 		break;
 	case BTRFS_LIST_OTIME:
-		if (subv->otime)
-			strftime(tstr, 256, "%Y-%m-%d %X",
-				 localtime(&subv->otime));
-		else
+		if (subv->otime) {
+			struct tm tm;
+
+			localtime_r(&subv->otime, &tm);
+			strftime(tstr, 256, "%Y-%m-%d %X", &tm);
+		} else
 			strcpy(tstr, "-");
 		printf("%s", tstr);
 		break;
@@ -1426,7 +1436,7 @@ static void print_single_volume_info_default(struct root_info *subv)
 	printf("\n");
 }
 
-static void print_all_volume_info_tab_head()
+static void print_all_volume_info_tab_head(void)
 {
 	int i;
 	int len;
@@ -1482,7 +1492,7 @@ static void print_all_volume_info(struct root_lookup *sorted_tree,
 	}
 }
 
-int btrfs_list_subvols(int fd, struct root_lookup *root_lookup)
+static int btrfs_list_subvols(int fd, struct root_lookup *root_lookup)
 {
 	int ret;
 
@@ -1527,7 +1537,7 @@ int btrfs_list_subvols_print(int fd, struct btrfs_list_filter_set *filter_set,
 	return 0;
 }
 
-char *strdup_or_null(const char *s)
+static char *strdup_or_null(const char *s)
 {
 	if (!s)
 		return NULL;
@@ -1694,7 +1704,7 @@ int btrfs_list_find_updated_files(int fd, u64 root_id, u64 oldest_gen)
 		if (ret < 0) {
 			fprintf(stderr, "ERROR: can't perform the search- %s\n",
 				strerror(e));
-			return ret;
+			break;
 		}
 		/* the ioctl returns the number of item it found in nr_items */
 		if (sk->nr_items == 0)
@@ -1794,7 +1804,7 @@ char *btrfs_list_path_for_root(int fd, u64 root)
 	return ret_path;
 }
 
-int btrfs_list_parse_sort_string(char *optarg,
+int btrfs_list_parse_sort_string(char *opt_arg,
 				 struct btrfs_list_comparer_set **comps)
 {
 	int order;
@@ -1803,7 +1813,7 @@ int btrfs_list_parse_sort_string(char *optarg,
 	char **ptr_argv;
 	int what_to_sort;
 
-	while ((p = strtok(optarg, ",")) != NULL) {
+	while ((p = strtok(opt_arg, ",")) != NULL) {
 		flag = 0;
 		ptr_argv = all_sort_items;
 
@@ -1839,7 +1849,7 @@ int btrfs_list_parse_sort_string(char *optarg,
 			what_to_sort = btrfs_list_get_sort_item(p);
 			btrfs_list_setup_comparer(comps, what_to_sort, order);
 		}
-		optarg = NULL;
+		opt_arg = NULL;
 	}
 
 	return 0;
@@ -1850,37 +1860,37 @@ int btrfs_list_parse_sort_string(char *optarg,
  *
  * type is the filter object.
  */
-int btrfs_list_parse_filter_string(char *optarg,
+int btrfs_list_parse_filter_string(char *opt_arg,
 				   struct btrfs_list_filter_set **filters,
 				   enum btrfs_list_filter_enum type)
 {
 
 	u64 arg;
 	char *ptr_parse_end = NULL;
-	char *ptr_optarg_end = optarg + strlen(optarg);
+	char *ptr_opt_arg_end = opt_arg + strlen(opt_arg);
 
-	switch (*(optarg++)) {
+	switch (*(opt_arg++)) {
 	case '+':
-		arg = (u64)strtol(optarg, &ptr_parse_end, 10);
+		arg = (u64)strtol(opt_arg, &ptr_parse_end, 10);
 		type += 2;
-		if (ptr_parse_end != ptr_optarg_end)
+		if (ptr_parse_end != ptr_opt_arg_end)
 			return -1;
 
 		btrfs_list_setup_filter(filters, type, arg);
 		break;
 	case '-':
-		arg = (u64)strtoll(optarg, &ptr_parse_end, 10);
+		arg = (u64)strtoll(opt_arg, &ptr_parse_end, 10);
 		type += 1;
-		if (ptr_parse_end != ptr_optarg_end)
+		if (ptr_parse_end != ptr_opt_arg_end)
 			return -1;
 
 		btrfs_list_setup_filter(filters, type, arg);
 		break;
 	default:
-		optarg--;
-		arg = (u64)strtoll(optarg, &ptr_parse_end, 10);
+		opt_arg--;
+		arg = (u64)strtoll(opt_arg, &ptr_parse_end, 10);
 
-		if (ptr_parse_end != ptr_optarg_end)
+		if (ptr_parse_end != ptr_opt_arg_end)
 			return -1;
 		btrfs_list_setup_filter(filters, type, arg);
 		break;

@@ -50,6 +50,8 @@ struct cmd_struct {
 	int hidden;
 };
 
+#define NULL_CMD_STRUCT {NULL, NULL, NULL, NULL, 0}
+
 struct cmd_group {
 	const char * const *usagestr;
 	const char *infostr;
@@ -70,12 +72,12 @@ int handle_command_group(const struct cmd_group *grp, int argc,
 /* help.c */
 extern const char * const generic_cmd_help_usage[];
 
-void usage(const char * const *usagestr);
+void usage(const char * const *usagestr) __attribute__((noreturn));
 void usage_command(const struct cmd_struct *cmd, int full, int err);
 void usage_command_group(const struct cmd_group *grp, int all, int err);
 
-void help_unknown_token(const char *arg, const struct cmd_group *grp);
-void help_ambiguous_token(const char *arg, const struct cmd_group *grp);
+void help_unknown_token(const char *arg, const struct cmd_group *grp) __attribute__((noreturn));
+void help_ambiguous_token(const char *arg, const struct cmd_group *grp) __attribute__((noreturn));
 
 void help_command_group(const struct cmd_group *grp, int argc, char **argv);
 
@@ -85,16 +87,18 @@ extern const struct cmd_group balance_cmd_group;
 extern const struct cmd_group device_cmd_group;
 extern const struct cmd_group scrub_cmd_group;
 extern const struct cmd_group inspect_cmd_group;
-extern const struct cmd_group send_cmd_group;
-extern const struct cmd_group receive_cmd_group;
 extern const struct cmd_group quota_cmd_group;
 extern const struct cmd_group qgroup_cmd_group;
 extern const struct cmd_group replace_cmd_group;
+extern const struct cmd_group rescue_cmd_group;
 
 extern const char * const cmd_send_usage[];
 extern const char * const cmd_receive_usage[];
 extern const char * const cmd_check_usage[];
+extern const char * const cmd_chunk_recover_usage[];
+extern const char * const cmd_super_recover_usage[];
 extern const char * const cmd_restore_usage[];
+extern const char * const cmd_rescue_usage[];
 
 int cmd_subvolume(int argc, char **argv);
 int cmd_filesystem(int argc, char **argv);
@@ -102,6 +106,8 @@ int cmd_balance(int argc, char **argv);
 int cmd_device(int argc, char **argv);
 int cmd_scrub(int argc, char **argv);
 int cmd_check(int argc, char **argv);
+int cmd_chunk_recover(int argc, char **argv);
+int cmd_super_recover(int argc, char **argv);
 int cmd_inspect(int argc, char **argv);
 int cmd_send(int argc, char **argv);
 int cmd_receive(int argc, char **argv);
@@ -112,6 +118,7 @@ int cmd_restore(int argc, char **argv);
 int cmd_select_super(int argc, char **argv);
 int cmd_dump_super(int argc, char **argv);
 int cmd_debug_tree(int argc, char **argv);
+int cmd_rescue(int argc, char **argv);
 
 /* subvolume exported functions */
 int test_issubvolume(char *path);
