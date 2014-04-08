@@ -109,13 +109,22 @@ btrfs \- control a btrfs filesystem
 .PP
 \fBbtrfs\fP \fBqgroup limit\fP [\fIoptions\fP] \fI<size>\fP|\fBnone\fP [\fI<qgroupid>\fP] \fI<path>\fP
 .PP
-.PP
 \fBbtrfs\fP \fBreplace start\fP [-Bfr] \fI<srcdev>\fP|\fI<devid> <targetdev> <mount_point>\fP
 .PP
 \fBbtrfs\fP \fBreplace status\fP [-1] \fI<mount_point>\fP
 .PP
 \fBbtrfs\fP \fBreplace cancel\fP \fI<mount_point>\fP
 .PP
+\fBbtrfs\fP \fBdedup enable\fP \fI<path>\fP
+.PP
+\fBbtrfs\fP \fBdedup disable\fP \fI<path>\fP
+.PP
+\fBbtrfs\fP \fBdedup on\fP [-b|--bs \fIsize\fP] \fI<path>\fP
+.PP
+\fBbtrfs\fP \fBdedup off\fP \fI<path>\fP
+.PP
+.PP
+
 \fBbtrfs\fP \fBhelp|\-\-help \fP
 .PP
 \fBbtrfs\fP \fB<command> \-\-help \fP
@@ -764,12 +773,28 @@ Print status and progress information of a running device replace operation.
 .IP "\fB-1\fP" 5
 print once instead of print continuously until the replace
 operation finishes (or is canceled)
-.RE
-.TP
 
 \fBreplace cancel\fR \fI<mount_point>\fR
 Cancel a running device replace operation.
 .RE
+.TP
+
+\fBdedup enable\fP \fI<path>\fP
+Enable data deduplication support for a filesystem.
+.TP
+
+\fBdedup disable\fP \fI<path>\fP
+Disable data deduplication support for a filesystem.
+.TP
+
+\fBdedup on\fP [-b|--bs \fIsize\fP] \fI<path>\fP
+Switch on data deduplication or change the dedup blocksize.
+.TP
+
+\fBdedup off\fP \fI<path>\fP
+Switch off data deduplication.
+.RE
+.TP
 
 .SH EXIT STATUS
 \fBbtrfs\fR returns a zero exist status if it succeeds. Non zero is returned in
