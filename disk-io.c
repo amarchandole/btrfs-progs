@@ -297,7 +297,7 @@ struct extent_buffer *read_tree_block(struct btrfs_root *root, u64 bytenr,
 			ignore = 1;
 			continue;
 		}
-		if (btrfs_header_generation(eb) > best_transid) {
+		if (btrfs_header_generation(eb) > best_transid && mirror_num) {
 			best_transid = btrfs_header_generation(eb);
 			good_mirror = mirror_num;
 		}
@@ -344,7 +344,7 @@ int write_and_map_eb(struct btrfs_trans_handle *trans,
 	return 0;
 }
 
-int write_tree_block(struct btrfs_trans_handle *trans,
+static int write_tree_block(struct btrfs_trans_handle *trans,
 		     struct btrfs_root *root,
 		     struct extent_buffer *eb)
 {
@@ -644,7 +644,10 @@ out:
 	blocksize = btrfs_level_size(root, btrfs_root_level(&root->root_item));
 	root->node = read_tree_block(root, btrfs_root_bytenr(&root->root_item),
 				     blocksize, generation);
-	BUG_ON(!root->node);
+	if (!root->node) {
+		free(root);
+		return ERR_PTR(-EIO);
+	}
 insert:
 	root->ref_cows = 1;
 	return root;
@@ -680,6 +683,7 @@ struct btrfs_root *btrfs_read_fs_root(struct btrfs_fs_info *fs_info,
 	struct btrfs_root *root;
 	struct rb_node *node;
 	int ret;
+	u64 objectid = location->objectid;
 
 	if (location->objectid == BTRFS_ROOT_TREE_OBJECTID)
 		return fs_info->tree_root;
@@ -695,7 +699,7 @@ struct btrfs_root *btrfs_read_fs_root(struct btrfs_fs_info *fs_info,
 	BUG_ON(location->objectid == BTRFS_TREE_RELOC_OBJECTID ||
 	       location->offset != (u64)-1);
 
-	node = rb_search(&fs_info->fs_root_tree, (void *)&location->objectid,
+	node = rb_search(&fs_info->fs_root_tree, (void *)&objectid,
 			 btrfs_fs_roots_compare_objectids, NULL);
 	if (node)
 		return container_of(node, struct btrfs_root, rb_node);
@@ -877,7 +881,17 @@ int btrfs_setup_all_roots(struct btrfs_fs_info *fs_info, u64 root_tree_bytenr,
 				  fs_info->extent_root);
 	if (ret) {
 		printk("Couldn't setup extent tree\n");
-		return -EIO;
+		if (!(flags & OPEN_CTREE_PARTIAL))
+			return -EIO;
+		/* Need a blank node here just so we don't screw up in the
+		 * million of places that assume a root has a valid ->node
+		 */
+		fs_info->extent_root->node =
+			btrfs_find_create_tree_block(fs_info->extent_root, 0,
+						     leafsize);
+		if (!fs_info->extent_root->node)
+			return -ENOMEM;
+		clear_extent_buffer_uptodate(NULL, fs_info->extent_root->node);
 	}
 	fs_info->extent_root->track_dirty = 1;
 
@@ -1044,6 +1058,7 @@ static struct btrfs_fs_info *__open_ctree_fd(int fp, const char *path,
 	struct btrfs_fs_devices *fs_devices = NULL;
 	struct extent_buffer *eb;
 	int ret;
+	int oflags;
 
 	if (sb_bytenr == 0)
 		sb_bytenr = BTRFS_SUPER_INFO_OFFSET;
@@ -1067,9 +1082,14 @@ static struct btrfs_fs_info *__open_ctree_fd(int fp, const char *path,
 
 	fs_info->fs_devices = fs_devices;
 	if (flags & OPEN_CTREE_WRITES)
-		ret = btrfs_open_devices(fs_devices, O_RDWR);
+		oflags = O_RDWR;
 	else
-		ret = btrfs_open_devices(fs_devices, O_RDONLY);
+		oflags = O_RDONLY;
+
+	if (flags & OPEN_CTREE_EXCLUSIVE)
+		oflags |= O_EXCL;
+
+	ret = btrfs_open_devices(fs_devices, oflags);
 	if (ret)
 		goto out_devices;
 
@@ -1098,7 +1118,7 @@ static struct btrfs_fs_info *__open_ctree_fd(int fp, const char *path,
 
 	eb = fs_info->chunk_root->node;
 	read_extent_buffer(eb, fs_info->chunk_tree_uuid,
-			   (unsigned long)btrfs_header_chunk_tree_uuid(eb),
+			   btrfs_header_chunk_tree_uuid(eb),
 			   BTRFS_UUID_SIZE);
 
 	ret = btrfs_setup_all_roots(fs_info, root_tree_bytenr, flags);
@@ -1186,7 +1206,14 @@ int btrfs_read_dev_super(int fd, struct btrfs_super_block *sb, u64 sb_bytenr)
 		return 0;
 	}
 
-	for (i = 0; i < BTRFS_SUPER_MIRROR_MAX; i++) {
+	/*
+	* we would like to check all the supers, but that would make
+	* a btrfs mount succeed after a mkfs from a different FS.
+	* So, we need to add a special mount option to scan for
+	* later supers, using BTRFS_SUPER_MIRROR_MAX instead
+	*/
+
+	for (i = 0; i < 1; i++) {
 		bytenr = btrfs_sb_offset(i);
 		ret = pread64(fd, &buf, sizeof(buf), bytenr);
 		if (ret < sizeof(buf))

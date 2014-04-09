@@ -78,7 +78,7 @@ static int finish_subvol(struct btrfs_receive *r)
 	int ret;
 	int subvol_fd = -1;
 	struct btrfs_ioctl_received_subvol_args rs_args;
-	char uuid_str[128];
+	char uuid_str[BTRFS_UUID_UNPARSED_SIZE];
 	u64 flags;
 
 	if (r->cur_subvol == NULL)
@@ -149,7 +149,7 @@ static int process_subvol(const char *path, const u8 *uuid, u64 ctransid,
 	int ret;
 	struct btrfs_receive *r = user;
 	struct btrfs_ioctl_vol_args args_v1;
-	char uuid_str[128];
+	char uuid_str[BTRFS_UUID_UNPARSED_SIZE];
 
 	ret = finish_subvol(r);
 	if (ret < 0)
@@ -196,7 +196,7 @@ static int process_snapshot(const char *path, const u8 *uuid, u64 ctransid,
 {
 	int ret;
 	struct btrfs_receive *r = user;
-	char uuid_str[128];
+	char uuid_str[BTRFS_UUID_UNPARSED_SIZE];
 	struct btrfs_ioctl_vol_args_v2 args_v2;
 	struct subvol_info *parent_subvol = NULL;
 
@@ -213,7 +213,7 @@ static int process_snapshot(const char *path, const u8 *uuid, u64 ctransid,
 	free(r->full_subvol_path);
 	r->full_subvol_path = path_cat3(r->root_path, r->dest_dir_path, path);
 
-	fprintf(stderr, "At snapshot %s\n", path);
+	fprintf(stdout, "At snapshot %s\n", path);
 
 	memcpy(r->cur_subvol->received_uuid, uuid, BTRFS_UUID_SIZE);
 	r->cur_subvol->stransid = ctransid;
@@ -234,6 +234,10 @@ static int process_snapshot(const char *path, const u8 *uuid, u64 ctransid,
 	parent_subvol = subvol_uuid_search(&r->sus, 0, parent_uuid,
 			parent_ctransid, NULL, subvol_search_by_received_uuid);
 	if (!parent_subvol) {
+		parent_subvol = subvol_uuid_search(&r->sus, 0, parent_uuid,
+				parent_ctransid, NULL, subvol_search_by_uuid);
+	}
+	if (!parent_subvol) {
 		ret = -ENOENT;
 		fprintf(stderr, "ERROR: could not find parent subvolume\n");
 		goto out;
@@ -253,8 +257,15 @@ static int process_snapshot(const char *path, const u8 *uuid, u64 ctransid,
 			O_RDONLY | O_NOATIME);
 	if (args_v2.fd < 0) {
 		ret = -errno;
-		fprintf(stderr, "ERROR: open %s failed. %s\n",
-				parent_subvol->path, strerror(-ret));
+		if (errno != ENOENT)
+			fprintf(stderr, "ERROR: open %s failed. %s\n",
+					parent_subvol->path, strerror(-ret));
+		else
+			fprintf(stderr,
+				"It seems that you have changed your default "
+				"subvolume or you specify other subvolume to\n"
+				"mount btrfs, try to remount this btrfs filesystem "
+				"with fs tree, and run btrfs receive again!\n");
 		goto out;
 	}
 
@@ -940,10 +951,8 @@ int cmd_receive(int argc, char **argv)
 		}
 	}
 
-	if (optind + 1 != argc) {
-		fprintf(stderr, "ERROR: receive needs path to subvolume\n");
-		return 1;
-	}
+	if (check_argc_exact(argc - optind, 1))
+		usage(cmd_receive_usage);
 
 	tomnt = argv[optind];
 

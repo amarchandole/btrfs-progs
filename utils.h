@@ -37,6 +37,8 @@
 #define BTRFS_ARG_UUID		2
 #define BTRFS_ARG_BLKDEV	3
 
+#define BTRFS_UUID_UNPARSED_SIZE	37
+
 int make_btrfs(int fd, const char *device, const char *label,
 	       u64 blocks[6], u64 num_bytes, u32 nodesize,
 	       u32 leafsize, u32 sectorsize, u32 stripesize, u64 features);
@@ -68,11 +70,12 @@ int pretty_size_snprintf(u64 size, char *str, size_t str_bytes);
 int get_mountpt(char *dev, char *mntpt, size_t size);
 int btrfs_scan_block_devices(int run_ioctl);
 u64 parse_size(char *s);
+u64 arg_strtou64(const char *str);
 int open_file_or_dir(const char *fname, DIR **dirstream);
 void close_file_or_dir(int fd, DIR *dirstream);
 int get_fs_info(char *path, struct btrfs_ioctl_fs_info_args *fi_args,
 		struct btrfs_ioctl_dev_info_args **di_ret);
-int get_label(const char *btrfs_dev);
+int get_label(const char *btrfs_dev, char *label);
 int set_label(const char *btrfs_dev, const char *label);
 
 char *__strncpy__null(char *dest, const char *src, size_t n);
@@ -94,5 +97,8 @@ int ask_user(char *question);
 int lookup_ino_rootid(int fd, u64 *rootid);
 int btrfs_scan_lblkid(int update_kernel);
 int get_btrfs_mount(const char *dev, char *mp, size_t mp_size);
+int find_mount_root(const char *path, char **mount_root);
+int get_device_info(int fd, u64 devid,
+		struct btrfs_ioctl_dev_info_args *di_args);
 
 #endif

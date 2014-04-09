@@ -399,8 +399,7 @@ static int update_root(struct root_lookup *root_lookup,
 	if (!ri || ri->root_id != root_id)
 		return -ENOENT;
 	if (name && name_len > 0) {
-		if (ri->name)
-			free(ri->name);
+		free(ri->name);
 
 		ri->name = malloc(name_len + 1);
 		if (!ri->name) {
@@ -515,15 +514,9 @@ static void __free_root_info(struct rb_node *node)
 	struct root_info *ri;
 
 	ri = rb_entry(node, struct root_info, rb_node);
-	if (ri->name)
-		free(ri->name);
-
-	if (ri->path)
-		free(ri->path);
-
-	if (ri->full_path)
-		free(ri->full_path);
-
+	free(ri->name);
+	free(ri->path);
+	free(ri->full_path);
 	free(ri);
 }
 
@@ -585,23 +578,18 @@ static int resolve_root(struct root_lookup *rl, struct root_info *ri,
 			full_path = strdup(found->path);
 			len = add_len;
 		}
+		if (!ri->top_id)
+			ri->top_id = found->ref_tree;
 
 		next = found->ref_tree;
-
-		if (next == top_id) {
-			ri->top_id = top_id;
+		if (next == top_id)
 			break;
-		}
-
 		/*
 		* if the ref_tree = BTRFS_FS_TREE_OBJECTID,
 		* we are at the top
 		*/
-		if (next == BTRFS_FS_TREE_OBJECTID) {
-			ri->top_id = next;
+		if (next == BTRFS_FS_TREE_OBJECTID)
 			break;
-		}
-
 		/*
 		* if the ref_tree wasn't in our tree of roots, the
 		* subvolume was deleted.
@@ -1228,11 +1216,6 @@ int btrfs_list_setup_filter(struct btrfs_list_filter_set **filter_set,
 	BUG_ON(filter >= BTRFS_LIST_FILTER_MAX);
 	BUG_ON(set->nfilters > set->total);
 
-	if (filter == BTRFS_LIST_FILTER_DELETED) {
-		set->only_deleted = 1;
-		return 0;
-	}
-
 	if (set->nfilters == set->total) {
 		size = set->total + BTRFS_LIST_NFILTERS_INCREASE;
 		size = sizeof(*set) + size * sizeof(struct btrfs_list_filter);
@@ -1251,6 +1234,9 @@ int btrfs_list_setup_filter(struct btrfs_list_filter_set **filter_set,
 
 	BUG_ON(set->filters[set->nfilters].filter_func);
 
+	if (filter == BTRFS_LIST_FILTER_DELETED)
+		set->only_deleted = 1;
+
 	set->filters[set->nfilters].filter_func = all_filter_funcs[filter];
 	set->filters[set->nfilters].data = data;
 	set->nfilters++;
@@ -1262,7 +1248,7 @@ static int filter_root(struct root_info *ri,
 {
 	int i, ret;
 
-	if (!set || !set->nfilters)
+	if (!set)
 		return 1;
 
 	if (set->only_deleted && !ri->deleted)
@@ -1331,7 +1317,7 @@ static void print_subvolume_column(struct root_info *subv,
 				   enum btrfs_list_column_enum column)
 {
 	char tstr[256];
-	char uuidparse[37];
+	char uuidparse[BTRFS_UUID_UNPARSED_SIZE];
 
 	BUG_ON(column >= BTRFS_LIST_ALL || column < 0);
 
@@ -1866,32 +1852,24 @@ int btrfs_list_parse_filter_string(char *opt_arg,
 {
 
 	u64 arg;
-	char *ptr_parse_end = NULL;
-	char *ptr_opt_arg_end = opt_arg + strlen(opt_arg);
 
 	switch (*(opt_arg++)) {
 	case '+':
-		arg = (u64)strtol(opt_arg, &ptr_parse_end, 10);
+		arg = arg_strtou64(opt_arg);
 		type += 2;
-		if (ptr_parse_end != ptr_opt_arg_end)
-			return -1;
 
 		btrfs_list_setup_filter(filters, type, arg);
 		break;
 	case '-':
-		arg = (u64)strtoll(opt_arg, &ptr_parse_end, 10);
+		arg = arg_strtou64(opt_arg);
 		type += 1;
-		if (ptr_parse_end != ptr_opt_arg_end)
-			return -1;
 
 		btrfs_list_setup_filter(filters, type, arg);
 		break;
 	default:
 		opt_arg--;
-		arg = (u64)strtoll(opt_arg, &ptr_parse_end, 10);
+		arg = arg_strtou64(opt_arg);
 
-		if (ptr_parse_end != ptr_opt_arg_end)
-			return -1;
 		btrfs_list_setup_filter(filters, type, arg);
 		break;
 	}

@@ -36,7 +36,7 @@
 #define FIELD_BUF_LEN 80
 
 struct extent_buffer *debug_corrupt_block(struct btrfs_root *root, u64 bytenr,
-				     u32 blocksize, int copy)
+				     u32 blocksize, u64 copy)
 {
 	int ret;
 	struct extent_buffer *eb;
@@ -105,6 +105,8 @@ static void print_usage(void)
 		"specify -i for the inode and -f for the field to corrupt)\n");
 	fprintf(stderr, "\t-m The metadata block to corrupt (must also "
 		"specify -f for the field to corrupt)\n");
+	fprintf(stderr, "\t-K The key to corrupt in the format "
+		"<num>,<num>,<num> (must also specify -f for the field)\n");
 	fprintf(stderr, "\t-f The field in the item to corrupt\n");
 	exit(1);
 }
@@ -163,7 +165,7 @@ static int corrupt_keys_in_block(struct btrfs_root *root, u64 bytenr)
 }
 
 static int corrupt_extent(struct btrfs_trans_handle *trans,
-			  struct btrfs_root *root, u64 bytenr, int copy)
+			  struct btrfs_root *root, u64 bytenr, u64 copy)
 {
 	struct btrfs_key key;
 	struct extent_buffer *leaf;
@@ -306,6 +308,13 @@ enum btrfs_metadata_block_field {
 	BTRFS_METADATA_BLOCK_BAD,
 };
 
+enum btrfs_key_field {
+	BTRFS_KEY_OBJECTID,
+	BTRFS_KEY_TYPE,
+	BTRFS_KEY_OFFSET,
+	BTRFS_KEY_BAD,
+};
+
 static enum btrfs_inode_field convert_inode_field(char *field)
 {
 	if (!strncmp(field, "isize", FIELD_BUF_LEN))
@@ -328,6 +337,17 @@ convert_metadata_block_field(char *field)
 	return BTRFS_METADATA_BLOCK_BAD;
 }
 
+static enum btrfs_key_field convert_key_field(char *field)
+{
+	if (!strncmp(field, "objectid", FIELD_BUF_LEN))
+		return BTRFS_KEY_OBJECTID;
+	if (!strncmp(field, "type", FIELD_BUF_LEN))
+		return BTRFS_KEY_TYPE;
+	if (!strncmp(field, "offset", FIELD_BUF_LEN))
+		return BTRFS_KEY_OFFSET;
+	return BTRFS_KEY_BAD;
+}
+
 static u64 generate_u64(u64 orig)
 {
 	u64 ret;
@@ -336,6 +356,73 @@ static u64 generate_u64(u64 orig)
 	} while (ret == orig);
 	return ret;
 }
+
+static u8 generate_u8(u8 orig)
+{
+	u8 ret;
+	do {
+		ret = rand();
+	} while (ret == orig);
+	return ret;
+}
+
+static int corrupt_key(struct btrfs_root *root, struct btrfs_key *key,
+		       char *field)
+{
+	enum btrfs_key_field corrupt_field = convert_key_field(field);
+	struct btrfs_path *path;
+	struct btrfs_trans_handle *trans;
+	int ret;
+
+	root = root->fs_info->fs_root;
+	if (corrupt_field == BTRFS_KEY_BAD) {
+		fprintf(stderr, "Invalid field %s\n", field);
+		return -EINVAL;
+	}
+
+	path = btrfs_alloc_path();
+	if (!path)
+		return -ENOMEM;
+
+	trans = btrfs_start_transaction(root, 1);
+	if (IS_ERR(trans)) {
+		btrfs_free_path(path);
+		return PTR_ERR(trans);
+	}
+
+	ret = btrfs_search_slot(trans, root, key, path, 0, 1);
+	if (ret < 0)
+		goto out;
+	if (ret > 0) {
+		fprintf(stderr, "Couldn't find the key to corrupt\n");
+		ret = -ENOENT;
+		goto out;
+	}
+
+	switch (corrupt_field) {
+	case BTRFS_KEY_OBJECTID:
+		key->objectid = generate_u64(key->objectid);
+		break;
+	case BTRFS_KEY_TYPE:
+		key->type = generate_u8(key->type);
+		break;
+	case BTRFS_KEY_OFFSET:
+		key->offset = generate_u64(key->objectid);
+		break;
+	default:
+		fprintf(stderr, "Invalid field %s, %d\n", field,
+			corrupt_field);
+		ret = -EINVAL;
+		goto out;
+	}
+
+	btrfs_set_item_key_unsafe(root, path, key);
+out:
+	btrfs_free_path(path);
+	btrfs_commit_transaction(trans, root);
+	return ret;
+}
+
 
 static int corrupt_inode(struct btrfs_trans_handle *trans,
 			 struct btrfs_root *root, u64 inode, char *field)
@@ -548,6 +635,7 @@ static struct option long_options[] = {
 	{ "file-extent", 1, NULL, 'x'},
 	{ "metadata-block", 1, NULL, 'm'},
 	{ "field", 1, NULL, 'f'},
+	{ "key", 1, NULL, 'K'},
 	{ 0, 0, 0, 0}
 };
 
@@ -696,6 +784,7 @@ out:
 int main(int ac, char **av)
 {
 	struct cache_tree root_cache;
+	struct btrfs_key key;
 	struct btrfs_root *root;
 	struct extent_buffer *eb;
 	char *dev;
@@ -703,7 +792,7 @@ int main(int ac, char **av)
 	u64 logical = (u64)-1;
 	int ret = 0;
 	int option_index = 0;
-	int copy = 0;
+	u64 copy = 0;
 	u64 bytes = 4096;
 	int extent_rec = 0;
 	int extent_tree = 0;
@@ -717,32 +806,23 @@ int main(int ac, char **av)
 
 	field[0] = '\0';
 	srand(128);
+	memset(&key, 0, sizeof(key));
 
 	while(1) {
 		int c;
-		c = getopt_long(ac, av, "l:c:b:eEkuUi:f:x:m:", long_options,
+		c = getopt_long(ac, av, "l:c:b:eEkuUi:f:x:m:K:", long_options,
 				&option_index);
 		if (c < 0)
 			break;
 		switch(c) {
 			case 'l':
-				logical = atoll(optarg);
+				logical = arg_strtou64(optarg);
 				break;
 			case 'c':
-				copy = atoi(optarg);
-				if (copy <= 0) {
-					fprintf(stderr,
-						"invalid copy number\n");
-					print_usage();
-				}
+				copy = arg_strtou64(optarg);
 				break;
 			case 'b':
-				bytes = atoll(optarg);
-				if (bytes == 0) {
-					fprintf(stderr,
-						"invalid byte count\n");
-					print_usage();
-				}
+				bytes = arg_strtou64(optarg);
 				break;
 			case 'e':
 				extent_rec = 1;
@@ -759,30 +839,24 @@ int main(int ac, char **av)
 			case 'U':
 				chunk_tree = 1;
 			case 'i':
-				inode = atoll(optarg);
-				if (inode == 0) {
-					fprintf(stderr,
-						"invalid inode number\n");
-					print_usage();
-				}
+				inode = arg_strtou64(optarg);
 				break;
 			case 'f':
 				strncpy(field, optarg, FIELD_BUF_LEN);
 				break;
 			case 'x':
-				errno = 0;
-				file_extent = atoll(optarg);
-				if (errno) {
-					fprintf(stderr, "error converting "
-						"%d\n", errno);
-					print_usage();
-				}
+				file_extent = arg_strtou64(optarg);
 				break;
 			case 'm':
-				errno = 0;
-				metadata_block = atoll(optarg);
-				if (errno) {
-					fprintf(stderr, "error converting "
+				metadata_block = arg_strtou64(optarg);
+				break;
+			case 'K':
+				ret = sscanf(optarg, "%llu,%u,%llu",
+					     &key.objectid,
+					     (unsigned int *)&key.type,
+					     &key.offset);
+				if (ret != 3) {
+					fprintf(stderr, "error reading key "
 						"%d\n", errno);
 					print_usage();
 				}
@@ -880,6 +954,12 @@ int main(int ac, char **av)
 		if (!strlen(field))
 			print_usage();
 		ret = corrupt_metadata_block(root, metadata_block, field);
+		goto out_close;
+	}
+	if (key.objectid || key.offset || key.type) {
+		if (!strlen(field))
+			print_usage();
+		ret = corrupt_key(root, &key, field);
 		goto out_close;
 	}
 	/*

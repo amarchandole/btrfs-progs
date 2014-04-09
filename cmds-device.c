@@ -85,7 +85,7 @@ static int cmd_add_dev(int argc, char **argv)
 
 	fdmnt = open_file_or_dir(mntpnt, &dirstream);
 	if (fdmnt < 0) {
-		fprintf(stderr, "ERROR: can't access to '%s'\n", mntpnt);
+		fprintf(stderr, "ERROR: can't access '%s'\n", mntpnt);
 		return 1;
 	}
 
@@ -111,13 +111,11 @@ static int cmd_add_dev(int argc, char **argv)
 
 		res = btrfs_prepare_device(devfd, argv[i], 1, &dev_block_count,
 					   0, &mixed, discard);
-		if (res) {
-			fprintf(stderr, "ERROR: Unable to init '%s'\n", argv[i]);
-			close(devfd);
-			ret++;
-			continue;
-		}
 		close(devfd);
+		if (res) {
+			ret++;
+			goto error_out;
+		}
 
 		strncpy_null(ioctl_args.name, argv[i]);
 		res = ioctl(fdmnt, BTRFS_IOC_ADD_DEV, &ioctl_args);
@@ -130,6 +128,7 @@ static int cmd_add_dev(int argc, char **argv)
 
 	}
 
+error_out:
 	close_file_or_dir(fdmnt, dirstream);
 	return !!ret;
 }
@@ -153,7 +152,7 @@ static int cmd_rm_dev(int argc, char **argv)
 
 	fdmnt = open_file_or_dir(mntpnt, &dirstream);
 	if (fdmnt < 0) {
-		fprintf(stderr, "ERROR: can't access to '%s'\n", mntpnt);
+		fprintf(stderr, "ERROR: can't access '%s'\n", mntpnt);
 		return 1;
 	}
 
@@ -161,6 +160,12 @@ static int cmd_rm_dev(int argc, char **argv)
 		struct	btrfs_ioctl_vol_args arg;
 		int	res;
 
+		if (!is_block_device(argv[i])) {
+			fprintf(stderr,
+				"ERROR: %s is not a block device\n", argv[i]);
+			ret++;
+			continue;
+		}
 		strncpy_null(arg.name, argv[i]);
 		res = ioctl(fdmnt, BTRFS_IOC_RM_DEV, &arg);
 		e = errno;
@@ -182,46 +187,68 @@ static int cmd_rm_dev(int argc, char **argv)
 }
 
 static const char * const cmd_scan_dev_usage[] = {
-	"btrfs device scan [<--all-devices>|<device> [<device>...]]",
+	"btrfs device scan [options] [<device> [<device>...]]",
 	"Scan devices for a btrfs filesystem",
+	"-d|--all-devices    scan all devices under /dev",
 	NULL
 };
 
 static int cmd_scan_dev(int argc, char **argv)
 {
-	int	i, fd, e;
-	int	where = BTRFS_SCAN_LBLKID;
-	int	devstart = 1;
+	int i, fd, e;
+	int where = BTRFS_SCAN_LBLKID;
+	int devstart = 1;
+	int all = 0;
+	int ret = 0;
 
-	if( argc > 1 && !strcmp(argv[1],"--all-devices")){
-		if (check_argc_max(argc, 2))
+	optind = 1;
+	while (1) {
+		int long_index;
+		static struct option long_options[] = {
+			{ "all-devices", no_argument, NULL, 'd'},
+			{ 0, 0, 0, 0 },
+		};
+		int c = getopt_long(argc, argv, "d", long_options,
+				    &long_index);
+		if (c < 0)
+			break;
+		switch (c) {
+		case 'd':
+			where = BTRFS_SCAN_DEV;
+			all = 1;
+			break;
+		default:
 			usage(cmd_scan_dev_usage);
-
-		where = BTRFS_SCAN_DEV;
-		devstart += 1;
+		}
 	}
 
-	if(argc<=devstart){
-		int ret;
+	if (all && check_argc_max(argc, 2))
+		usage(cmd_scan_dev_usage);
+
+	if (all || argc == 1) {
 		printf("Scanning for Btrfs filesystems\n");
 		ret = scan_for_btrfs(where, BTRFS_UPDATE_KERNEL);
-		if (ret){
+		if (ret)
 			fprintf(stderr, "ERROR: error %d while scanning\n", ret);
-			return 1;
-		}
-		return 0;
+		goto out;
 	}
 
 	fd = open("/dev/btrfs-control", O_RDWR);
 	if (fd < 0) {
 		perror("failed to open /dev/btrfs-control");
-		return 1;
+		ret = 1;
+		goto out;
 	}
 
 	for( i = devstart ; i < argc ; i++ ){
 		struct btrfs_ioctl_vol_args args;
-		int ret;
 
+		if (!is_block_device(argv[i])) {
+			fprintf(stderr,
+				"ERROR: %s is not a block device\n", argv[i]);
+			ret = 1;
+			goto close_out;
+		}
 		printf("Scanning for Btrfs filesystems in '%s'\n", argv[i]);
 
 		strncpy_null(args.name, argv[i]);
@@ -234,15 +261,16 @@ static int cmd_scan_dev(int argc, char **argv)
 		e = errno;
 
 		if( ret < 0 ){
-			close(fd);
 			fprintf(stderr, "ERROR: unable to scan the device '%s' - %s\n",
 				argv[i], strerror(e));
-			return 1;
+			goto close_out;
 		}
 	}
 
+close_out:
 	close(fd);
-	return 0;
+out:
+	return !!ret;
 }
 
 static const char * const cmd_ready_dev_usage[] = {
@@ -263,6 +291,12 @@ static int cmd_ready_dev(int argc, char **argv)
 	fd = open("/dev/btrfs-control", O_RDWR);
 	if (fd < 0) {
 		perror("failed to open /dev/btrfs-control");
+		return 1;
+	}
+	if (!is_block_device(argv[1])) {
+		fprintf(stderr,
+			"ERROR: %s is not a block device\n", argv[1]);
+		close(fd);
 		return 1;
 	}
 
@@ -306,18 +340,13 @@ static int cmd_dev_stats(int argc, char **argv)
 			break;
 		case '?':
 		default:
-			fprintf(stderr, "ERROR: device stat args invalid.\n"
-					" device stat [-z] <path>|<device>\n"
-					" -z  to reset stats after reading.\n");
-			return 1;
+			usage(cmd_dev_stats_usage);
 		}
 	}
 
-	if (optind + 1 != argc) {
-		fprintf(stderr, "ERROR: device stat needs path|device as single"
-			" argument\n");
-		return 1;
-	}
+	argc = argc - optind;
+	if (check_argc_exact(argc, 1))
+		usage(cmd_dev_stats_usage);
 
 	dev_path = argv[optind];
 

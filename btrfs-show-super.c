@@ -59,17 +59,17 @@ int main(int argc, char **argv)
 	int all = 0;
 	char *filename;
 	int fd = -1;
-	int arg, i;
+	int i;
+	u64 arg;
 	u64 sb_bytenr = btrfs_sb_offset(0);
 
 	while ((opt = getopt(argc, argv, "ai:")) != -1) {
 		switch (opt) {
 		case 'i':
-			arg = atoi(optarg);
-
-			if (arg < 0 || arg >= BTRFS_SUPER_MIRROR_MAX) {
+			arg = arg_strtou64(optarg);
+			if (arg >= BTRFS_SUPER_MIRROR_MAX) {
 				fprintf(stderr,
-					"Illegal super_mirror %d\n",
+					"Illegal super_mirror %llu\n",
 					arg);
 				print_usage();
 				exit(1);
@@ -165,7 +165,7 @@ static int check_csum_sblock(void *sb, int csum_size)
 static void dump_superblock(struct btrfs_super_block *sb)
 {
 	int i;
-	char *s, buf[36+1];
+	char *s, buf[BTRFS_UUID_UNPARSED_SIZE];
 	u8 *p;
 
 	printf("csum\t\t\t0x");

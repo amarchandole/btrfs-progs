@@ -111,10 +111,11 @@ int main(int argc, char *argv[])
 	int success = 0;
 	int extrefs_flag = 0;
 	int seeding_flag = 0;
-	int seeding_value = 0;
+	u64 seeding_value = 0;
 	int skinny_flag = 0;
 	int ret;
 
+	optind = 1;
 	while(1) {
 		int c = getopt(argc, argv, "S:rx");
 		if (c < 0)
@@ -122,7 +123,7 @@ int main(int argc, char *argv[])
 		switch(c) {
 		case 'S':
 			seeding_flag = 1;
-			seeding_value = atoi(optarg);
+			seeding_value = arg_strtou64(optarg);
 			break;
 		case 'r':
 			extrefs_flag = 1;
@@ -143,7 +144,19 @@ int main(int argc, char *argv[])
 		return 1;
 	}
 
-	if (check_mounted(device)) {
+	if (!(seeding_flag + extrefs_flag + skinny_flag)) {
+		fprintf(stderr,
+			"ERROR: At least one option should be assigned.\n");
+		print_usage();
+		return 1;
+	}
+
+	ret = check_mounted(device);
+	if (ret < 0) {
+		fprintf(stderr, "Could not check mount status: %s\n",
+			strerror(-ret));
+		return 1;
+	} else if (ret) {
 		fprintf(stderr, "%s is mounted\n", device);
 		return 1;
 	}
@@ -176,6 +189,7 @@ int main(int argc, char *argv[])
 	} else {
 		root->fs_info->readonly = 1;
 		ret = 1;
+		fprintf(stderr, "btrfstune failed\n");
 	}
 	close_ctree(root);
 

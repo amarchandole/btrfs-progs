@@ -291,8 +291,6 @@ static int __load_free_space_cache(struct btrfs_root *root,
 		return 0;
 	}
 
-	ret = -1;
-
 	leaf = path->nodes[0];
 	header = btrfs_item_ptr(leaf, path->slots[0],
 				struct btrfs_free_space_header);
@@ -435,7 +433,7 @@ int load_free_space_cache(struct btrfs_fs_info *fs_info,
 	if (ret < 0) {
 		ret = 0;
 
-		printf("failed to load free space cache for block group %llu",
+		printf("failed to load free space cache for block group %llu\n",
 			block_group->key.objectid);
 	}
 
@@ -781,8 +779,7 @@ void __btrfs_remove_free_space_cache(struct btrfs_free_space_ctl *ctl)
 	while ((node = rb_last(&ctl->free_space_offset)) != NULL) {
 		info = rb_entry(node, struct btrfs_free_space, offset_index);
 		unlink_free_space(ctl, info);
-		if (info->bitmap)
-			free(info->bitmap);
+		free(info->bitmap);
 		free(info);
 	}
 }

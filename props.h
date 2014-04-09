@@ -1,8 +1,4 @@
-
 /*
- * Copyright (C) 2012 FUJITSU LIMITED.  All rights reserved.
- * Written by Miao Xie <miaox@cn.fujitsu.com>
- *
  * This program is free software; you can redistribute it and/or
  * modify it under the terms of the GNU General Public
  * License v2 as published by the Free Software Foundation.
@@ -18,16 +14,30 @@
  * Boston, MA 021110-1307, USA.
  */
 
-#ifndef __BTRFS_MATH_H
-#define __BTRFS_MATH_H
+#ifndef PROPS_H_
+#define PROPS_H_
 
-static inline u64 div_factor(u64 num, int factor)
-{
-	if (factor == 10)
-		return num;
-	num *= factor;
-	num /= 10;
-	return num;
-}
+enum prop_object_type {
+	prop_object_dev		= (1 << 0),
+	prop_object_root	= (1 << 1),
+	prop_object_subvol	= (1 << 2),
+	prop_object_inode	= (1 << 3),
+	__prop_object_max,
+};
 
-#endif
+typedef int (*prop_handler_t)(enum prop_object_type type,
+			      const char *object,
+			      const char *name,
+			      const char *value);
+
+struct prop_handler {
+	const char *name;
+	const char *desc;
+	int read_only;
+	int types;
+	prop_handler_t handler;
+};
+
+extern const struct prop_handler prop_handlers[];
+
+#endif /* PROPS_H_ */

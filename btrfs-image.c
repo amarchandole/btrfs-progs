@@ -1350,7 +1350,7 @@ static void update_super_old(u8 *buffer)
 
 	btrfs_set_stack_chunk_length(chunk, (u64)-1);
 	btrfs_set_stack_chunk_owner(chunk, BTRFS_EXTENT_TREE_OBJECTID);
-	btrfs_set_stack_chunk_stripe_len(chunk, 64 * 1024);
+	btrfs_set_stack_chunk_stripe_len(chunk, BTRFS_STRIPE_LEN);
 	btrfs_set_stack_chunk_type(chunk, BTRFS_BLOCK_GROUP_SYSTEM);
 	btrfs_set_stack_chunk_io_align(chunk, sectorsize);
 	btrfs_set_stack_chunk_io_width(chunk, sectorsize);
@@ -1373,7 +1373,6 @@ static int update_super(u8 *buffer)
 	u32 new_array_size = 0;
 	u32 array_size;
 	u32 cur = 0;
-	u32 new_cur = 0;
 	u8 *ptr, *write_ptr;
 	int old_num_stripes;
 
@@ -1390,7 +1389,6 @@ static int update_super(u8 *buffer)
 		write_ptr += sizeof(*disk_key);
 		ptr += sizeof(*disk_key);
 		cur += sizeof(*disk_key);
-		new_cur += sizeof(*disk_key);
 
 		if (key.type == BTRFS_CHUNK_ITEM_KEY) {
 			chunk = (struct btrfs_chunk *)ptr;
@@ -1406,7 +1404,6 @@ static int update_super(u8 *buffer)
 			memcpy(chunk->stripe.dev_uuid, super->dev_item.uuid,
 			       BTRFS_UUID_SIZE);
 			new_array_size += sizeof(*chunk);
-			new_cur += sizeof(*chunk);
 		} else {
 			fprintf(stderr, "Bogus key in the sys chunk array "
 				"%d\n", key.type);
@@ -1521,7 +1518,8 @@ static int fixup_chunk_tree_block(struct mdrestore_struct *mdres,
 			type = btrfs_stack_chunk_type(&chunk);
 			type &= (BTRFS_BLOCK_GROUP_DATA |
 				 BTRFS_BLOCK_GROUP_SYSTEM |
-				 BTRFS_BLOCK_GROUP_METADATA);
+				 BTRFS_BLOCK_GROUP_METADATA |
+				 BTRFS_BLOCK_GROUP_DUP);
 			btrfs_set_stack_chunk_type(&chunk, type);
 
 			btrfs_set_stack_chunk_num_stripes(&chunk, 1);
@@ -2463,8 +2461,8 @@ int main(int argc, char *argv[])
 {
 	char *source;
 	char *target;
-	int num_threads = 0;
-	int compress_level = 0;
+	u64 num_threads = 0;
+	u64 compress_level = 0;
 	int create = 1;
 	int old_restore = 0;
 	int walk_trees = 0;
@@ -2483,13 +2481,13 @@ int main(int argc, char *argv[])
 			create = 0;
 			break;
 		case 't':
-			num_threads = atoi(optarg);
-			if (num_threads <= 0 || num_threads > 32)
+			num_threads = arg_strtou64(optarg);
+			if (num_threads > 32)
 				print_usage();
 			break;
 		case 'c':
-			compress_level = atoi(optarg);
-			if (compress_level < 0 || compress_level > 9)
+			compress_level = arg_strtou64(optarg);
+			if (compress_level > 9)
 				print_usage();
 			break;
 		case 'o':

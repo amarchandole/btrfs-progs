@@ -39,6 +39,7 @@
 #include "ioctl.h"
 #include "commands.h"
 #include "list.h"
+#include "utils.h"
 
 #include "send.h"
 #include "send-utils.h"
@@ -56,54 +57,6 @@ struct btrfs_send {
 	char *root_path;
 	struct subvol_uuid_search sus;
 };
-
-int find_mount_root(const char *path, char **mount_root)
-{
-	FILE *mnttab;
-	int fd;
-	struct mntent *ent;
-	int len;
-	int ret;
-	int longest_matchlen = 0;
-	char *longest_match = NULL;
-
-	fd = open(path, O_RDONLY | O_NOATIME);
-	if (fd < 0)
-		return -errno;
-	close(fd);
-
-	mnttab = fopen("/proc/mounts", "r");
-	if (!mnttab)
-		return -errno;
-
-	while ((ent = getmntent(mnttab))) {
-		len = strlen(ent->mnt_dir);
-		if (strncmp(ent->mnt_dir, path, len) == 0) {
-			/* match found */
-			if (longest_matchlen < len) {
-				free(longest_match);
-				longest_matchlen = len;
-				longest_match = strdup(ent->mnt_dir);
-			}
-		}
-	}
-	fclose(mnttab);
-
-	if (!longest_match) {
-		fprintf(stderr,
-			"ERROR: Failed to find mount root for path %s.\n",
-			path);
-		return -ENOENT;
-	}
-
-	ret = 0;
-	*mount_root = realpath(longest_match, NULL);
-	if (!*mount_root)
-		ret = -errno;
-
-	free(longest_match);
-	return ret;
-}
 
 static int get_root_id(struct btrfs_send *s, const char *path, u64 *root_id)
 {
@@ -282,31 +235,21 @@ out:
 	return ERR_PTR(ret);
 }
 
-static int do_send(struct btrfs_send *send, u64 root_id, u64 parent_root_id,
-		   int is_first_subvol, int is_last_subvol)
+static int do_send(struct btrfs_send *send, u64 parent_root_id,
+		   int is_first_subvol, int is_last_subvol, char *subvol)
 {
 	int ret;
 	pthread_t t_read;
 	pthread_attr_t t_attr;
 	struct btrfs_ioctl_send_args io_send;
-	struct subvol_info *si;
 	void *t_err = NULL;
 	int subvol_fd = -1;
 	int pipefd[2] = {-1, -1};
 
-	si = subvol_uuid_search(&send->sus, root_id, NULL, 0, NULL,
-			subvol_search_by_root_id);
-	if (!si) {
-		ret = -ENOENT;
-		fprintf(stderr, "ERROR: could not find subvol info for %llu",
-				root_id);
-		goto out;
-	}
-
-	subvol_fd = openat(send->mnt_fd, si->path, O_RDONLY | O_NOATIME);
+	subvol_fd = openat(send->mnt_fd, subvol, O_RDONLY | O_NOATIME);
 	if (subvol_fd < 0) {
 		ret = -errno;
-		fprintf(stderr, "ERROR: open %s failed. %s\n", si->path,
+		fprintf(stderr, "ERROR: open %s failed. %s\n", subvol,
 				strerror(-ret));
 		goto out;
 	}
@@ -385,10 +328,6 @@ out:
 		close(pipefd[0]);
 	if (pipefd[1] != -1)
 		close(pipefd[1]);
-	if (si) {
-		free(si->path);
-		free(si);
-	}
 	return ret;
 }
 
@@ -518,6 +457,18 @@ int cmd_send(int argc, char **argv)
 						"root_id for %s\n", subvol);
 				goto out;
 			}
+
+			ret = is_subvol_ro(&send, subvol);
+			if (ret < 0)
+				goto out;
+			if (!ret) {
+				ret = -EINVAL;
+				fprintf(stderr,
+				"ERROR: cloned subvol %s is not read-only.\n",
+					subvol);
+				goto out;
+			}
+
 			add_clone_source(&send, root_id);
 			subvol_uuid_search_finit(&send.sus);
 			free(subvol);
@@ -546,6 +497,18 @@ int cmd_send(int argc, char **argv)
 						"%s\n", optarg, strerror(-ret));
 				goto out;
 			}
+
+			ret = is_subvol_ro(&send, snapshot_parent);
+			if (ret < 0)
+				goto out;
+			if (!ret) {
+				ret = -EINVAL;
+				fprintf(stderr,
+					"ERROR: parent %s is not read-only.\n",
+					snapshot_parent);
+				goto out;
+			}
+
 			full_send = 0;
 			break;
 		case 'i':
@@ -561,11 +524,8 @@ int cmd_send(int argc, char **argv)
 		}
 	}
 
-	if (optind == argc) {
-		fprintf(stderr, "ERROR: send needs path to snapshot\n");
-		ret = 1;
-		goto out;
-	}
+	if (optind == argc)
+		usage(cmd_send_usage);
 
 	if (outname != NULL) {
 		send.dump_fd = creat(outname, 0600);
@@ -664,14 +624,6 @@ int cmd_send(int argc, char **argv)
 			goto out;
 		}
 
-		ret = get_root_id(&send, get_subvol_name(send.root_path, subvol),
-				&root_id);
-		if (ret < 0) {
-			fprintf(stderr, "ERROR: could not resolve root_id "
-					"for %s\n", subvol);
-			goto out;
-		}
-
 		if (!full_send && !parent_root_id) {
 			ret = find_good_parent(&send, root_id, &parent_root_id);
 			if (ret < 0) {
@@ -700,8 +652,8 @@ int cmd_send(int argc, char **argv)
 			is_first_subvol = 1;
 			is_last_subvol = 1;
 		}
-		ret = do_send(&send, root_id, parent_root_id,
-			      is_first_subvol, is_last_subvol);
+		ret = do_send(&send, parent_root_id, is_first_subvol,
+			      is_last_subvol, subvol);
 		if (ret < 0)
 			goto out;
 
@@ -726,9 +678,9 @@ out:
 }
 
 const char * const cmd_send_usage[] = {
-	"btrfs send [-ve] [-p <parent>] [-c <clone-src>] [-f <outfile>] <subvol>",
-	"Send the subvolume to stdout.",
-	"Sends the subvolume specified by <subvol> to stdout.",
+	"btrfs send [-ve] [-p <parent>] [-c <clone-src>] [-f <outfile>] <subvol> [<subvol>...]",
+	"Send the subvolume(s) to stdout.",
+	"Sends the subvolume(s) specified by <subvol> to stdout.",
 	"By default, this will send the whole subvolume. To do an incremental",
 	"send, use '-p <parent>'. If you want to allow btrfs to clone from",
 	"any additional local snapshots, use '-c <clone-src>' (multiple times",

@@ -160,11 +160,12 @@ static int device_list_add(const char *path,
 int btrfs_close_devices(struct btrfs_fs_devices *fs_devices)
 {
 	struct btrfs_fs_devices *seed_devices;
-	struct list_head *cur;
 	struct btrfs_device *device;
+
 again:
-	list_for_each(cur, &fs_devices->devices) {
-		device = list_entry(cur, struct btrfs_device, dev_list);
+	while (!list_empty(&fs_devices->devices)) {
+		device = list_entry(fs_devices->devices.next,
+				    struct btrfs_device, dev_list);
 		if (device->fd != -1) {
 			fsync(device->fd);
 			if (posix_fadvise(device->fd, 0, 0, POSIX_FADV_DONTNEED))
@@ -173,6 +174,11 @@ again:
 			device->fd = -1;
 		}
 		device->writeable = 0;
+		list_del(&device->dev_list);
+		/* free the memory */
+		free(device->name);
+		free(device->label);
+		free(device);
 	}
 
 	seed_devices = fs_devices->seed;
@@ -182,6 +188,7 @@ again:
 		goto again;
 	}
 
+	free(fs_devices);
 	return 0;
 }
 
@@ -214,7 +221,7 @@ int btrfs_open_devices(struct btrfs_fs_devices *fs_devices, int flags)
 		if (device->devid == fs_devices->lowest_devid)
 			fs_devices->lowest_bdev = fd;
 		device->fd = fd;
-		if (flags == O_RDWR)
+		if (flags & O_RDWR)
 			device->writeable = 1;
 	}
 	return 0;
@@ -655,7 +662,7 @@ static u64 chunk_bytes_by_type(u64 type, u64 calc_size, int num_stripes,
 static u32 find_raid56_stripe_len(u32 data_devices, u32 dev_stripe_target)
 {
 	/* TODO, add a way to store the preferred stripe size */
-	return 64 * 1024;
+	return BTRFS_STRIPE_LEN;
 }
 
 /*
@@ -773,7 +780,7 @@ int btrfs_alloc_chunk(struct btrfs_trans_handle *trans,
 	int looped = 0;
 	int ret;
 	int index;
-	int stripe_len = 64 * 1024;
+	int stripe_len = BTRFS_STRIPE_LEN;
 	struct btrfs_key key;
 	u64 offset;
 
@@ -1010,7 +1017,7 @@ int btrfs_alloc_data_chunk(struct btrfs_trans_handle *trans,
 	int sub_stripes = 0;
 	int ret;
 	int index;
-	int stripe_len = 64 * 1024;
+	int stripe_len = BTRFS_STRIPE_LEN;
 	struct btrfs_key key;
 
 	key.objectid = BTRFS_FIRST_CHUNK_TREE_OBJECTID;
@@ -1267,13 +1274,11 @@ int __btrfs_map_block(struct btrfs_mapping_tree *map_tree, int rw,
 again:
 	ce = search_cache_extent(&map_tree->cache_tree, logical);
 	if (!ce) {
-		if (multi)
-			kfree(multi);
+		kfree(multi);
 		return -ENOENT;
 	}
 	if (ce->start > logical || ce->start + ce->size < logical) {
-		if (multi)
-			kfree(multi);
+		kfree(multi);
 		return -ENOENT;
 	}
 
@@ -1496,8 +1501,15 @@ int btrfs_chunk_readonly(struct btrfs_root *root, u64 chunk_offset)
 	int readonly = 0;
 	int i;
 
+	/*
+	 * During chunk recovering, we may fail to find block group's
+	 * corresponding chunk, we will rebuild it later
+	 */
 	ce = search_cache_extent(&map_tree->cache_tree, chunk_offset);
-	BUG_ON(!ce);
+	if (!root->fs_info->is_chunk_recover)
+		BUG_ON(!ce);
+	else
+		return 0;
 
 	map = container_of(ce, struct map_lookup, ce);
 	for (i = 0; i < map->num_stripes; i++) {
